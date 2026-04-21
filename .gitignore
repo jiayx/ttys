@@ -1,0 +1,13 @@
+node_modules
+.pnpm-store
+dist
+.wrangler
+coverage
+*.log
+agent/bin
+
+.cache/
+agent/.cache/
+apps/web/public/downloads/local/ttys-agent
+apps/web/public/downloads/local/ttys-agent-*
+apps/web/public/downloads/local/checksums.txt
