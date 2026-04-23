@@ -3,8 +3,8 @@
   "private": true,
   "packageManager": "pnpm@10.18.0",
   "scripts": {
-    "dev": "pnpm --filter @ttys/web dev",
-    "build": "pnpm --filter @ttys/web build",
-    "deploy": "pnpm --filter @ttys/web deploy"
+    "dev": "pnpm --filter @ttys/web run dev",
+    "build": "pnpm --filter @ttys/web run build",
+    "deploy": "pnpm --filter @ttys/web run deploy"
   }
 }
