@@ -12,7 +12,7 @@ on:
 jobs:
   build-go:
     name: Go ${{ matrix.goos }}-${{ matrix.goarch }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -34,11 +34,13 @@ jobs:
             ext: ".exe"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: agent/go.mod
+          cache: true
+          cache-dependency-path: agent/go.sum
 
       - name: Build Go agent
         shell: bash
@@ -54,7 +56,7 @@ jobs:
           CGO_ENABLED=0 \
           go build -trimpath -ldflags="-s -w" -o "../dist/${asset}" ./cmd/ttys-agent
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: go-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
@@ -68,25 +70,25 @@ jobs:
       matrix:
         include:
           - id: darwin-amd64
-            runner: macos-13
+            runner: macos-15-intel
             target: ""
             linux_transport: ""
             ext: ""
             asset: ttys-agent-zig-darwin-amd64
           - id: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             target: ""
             linux_transport: ""
             ext: ""
             asset: ttys-agent-zig-darwin-arm64
           - id: linux-amd64-system
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             target: ""
             linux_transport: system
             ext: ""
             asset: ttys-agent-zig-linux-amd64-system
           - id: linux-amd64-portable
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             target: x86_64-linux-gnu
             linux_transport: portable
             ext: ""
@@ -98,24 +100,31 @@ jobs:
             ext: ""
             asset: ttys-agent-zig-linux-arm64-system
           - id: linux-arm64-portable
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             target: aarch64-linux-gnu
             linux_transport: portable
             ext: ""
             asset: ttys-agent-zig-linux-arm64-portable
           - id: windows-amd64
-            runner: windows-latest
+            runner: windows-2025
             target: x86_64-windows-gnu
             linux_transport: ""
             ext: ".exe"
             asset: ttys-agent-zig-windows-amd64.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+
+      - uses: actions/cache@v5
+        with:
+          path: agent-zig/.zig-cache
+          key: zig-${{ matrix.id }}-0.16.0-${{ hashFiles('agent-zig/build.zig', 'agent-zig/build.zig.zon', 'agent-zig/src/**') }}
+          restore-keys: |
+            zig-${{ matrix.id }}-0.16.0-
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux' && matrix.linux_transport == 'system'
@@ -153,7 +162,7 @@ jobs:
 
           cp "zig-out/bin/ttys-agent-zig${{ matrix.ext }}" "../dist/${{ matrix.asset }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zig-${{ matrix.id }}
           path: dist/*
@@ -161,7 +170,7 @@ jobs:
 
   bundle-release:
     name: Bundle Release Assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - build-go
       - build-zig
@@ -169,7 +178,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
@@ -181,7 +190,7 @@ jobs:
           cd dist
           sha256sum * > checksums.txt
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-assets
           path: dist/*
@@ -189,7 +198,7 @@ jobs:
 
       - name: Publish GitHub release assets
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
