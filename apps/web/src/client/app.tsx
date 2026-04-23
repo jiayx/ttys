@@ -30,10 +30,17 @@ type SessionStatus = {
 type PlatformTab = "macos" | "linux" | "windows";
 type TransportState = "idle" | "connecting" | "connected" | "reconnecting" | "closed" | "error";
 type CopyLabel = "Copy" | "Copied" | "Copy failed";
+type FlashPalette = {
+  first: string;
+  firstGlow: string;
+  second: string;
+  secondGlow: string;
+};
 
 export function App() {
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const terminal = useRef<TerminalController | null>(null);
+  const requestControlButtonRef = useRef<HTMLButtonElement | null>(null);
   const socket = useRef<WebSocket | null>(null);
   const inputCleanup = useRef<(() => void) | null>(null);
   const canWriteRef = useRef(false);
@@ -251,6 +258,7 @@ export function App() {
       inputCleanup.current?.();
       inputCleanup.current = terminal.current?.onData((value) => {
         if (!canWriteRef.current) {
+          flashRequestControlButton();
           return;
         }
         ws.send(JSON.stringify({ type: "stdin", payload: { data: value } }));
@@ -455,6 +463,43 @@ export function App() {
     setRequestingControl(true);
   }
 
+  function flashRequestControlButton() {
+    const button = requestControlButtonRef.current;
+    if (!button) {
+      return;
+    }
+
+    const palette = pickFlashPalette();
+    button.animate(
+      [
+        {
+          transform: "scale(1)",
+          borderColor: "rgba(56, 189, 248, 0.3)",
+          boxShadow: "0 0 0 rgba(56, 189, 248, 0)",
+        },
+        {
+          transform: "scale(1.01)",
+          borderColor: palette.first,
+          boxShadow: `0 0 0 2px ${palette.firstGlow}`,
+        },
+        {
+          transform: "scale(1)",
+          borderColor: palette.second,
+          boxShadow: `0 0 0 3px ${palette.secondGlow}`,
+        },
+        {
+          transform: "scale(1)",
+          borderColor: "rgba(56, 189, 248, 0.3)",
+          boxShadow: "0 0 0 rgba(56, 189, 248, 0)",
+        },
+      ],
+      {
+        duration: 520,
+        easing: "ease-out",
+      },
+    );
+  }
+
   const modeLabel = sessionStatus?.canWrite ? "Control granted" : "Read-only";
   const leaseLabel = formatDeadline(sessionStatus?.controlLeaseExpiresAt ?? null, now);
   const sessionExpiryLabel = formatDeadline(sessionStatus?.sessionExpiresAt ?? null, now);
@@ -551,6 +596,7 @@ export function App() {
                     "Viewers are read-only by default. Request control to type into the host shell."}
                 </p>
                 <button
+                  ref={requestControlButtonRef}
                   type="button"
                   onClick={requestControl}
                   disabled={!canRequestControl || requestingControl}
@@ -768,6 +814,22 @@ function transportLabel(value: string) {
     default:
       return "Idle";
   }
+}
+
+function pickFlashPalette(): FlashPalette {
+  const firstHue = Math.floor(Math.random() * 360);
+  const firstSaturation = Math.floor(Math.random() * 101);
+  const firstLightness = 35 + Math.floor(Math.random() * 41);
+  const secondHue = Math.floor(Math.random() * 360);
+  const secondSaturation = Math.floor(Math.random() * 101);
+  const secondLightness = 35 + Math.floor(Math.random() * 41);
+
+  return {
+    first: `hsl(${firstHue} ${firstSaturation}% ${firstLightness}%)`,
+    firstGlow: `hsl(${firstHue} ${firstSaturation}% ${firstLightness}% / 0.22)`,
+    second: `hsl(${secondHue} ${secondSaturation}% ${secondLightness}%)`,
+    secondGlow: `hsl(${secondHue} ${secondSaturation}% ${secondLightness}% / 0.18)`,
+  };
 }
 
 function parseControlFrame(value: string): Record<string, unknown> | null {
