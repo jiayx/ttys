@@ -28,9 +28,6 @@ export function mountTerminal(container: HTMLElement): TerminalController {
   terminal.loadAddon(fit);
   terminal.open(container);
   fit.fit();
-  terminal.writeln("ttys frontend scaffold ready");
-  terminal.writeln("");
-  terminal.writeln("Waiting for session transport...");
 
   const resizeObserver = new ResizeObserver(() => {
     fit.fit();

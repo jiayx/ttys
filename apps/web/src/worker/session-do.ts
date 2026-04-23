@@ -155,7 +155,7 @@ export class TTYSession extends DurableObject {
       return;
     }
 
-    if ((frame?.type === "stdin" || frame?.type === "resize") && this.canWrite(socket)) {
+    if (frame?.type === "stdin" && this.canWrite(socket)) {
       this.host?.send(data);
     }
   }

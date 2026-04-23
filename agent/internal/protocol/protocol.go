@@ -3,7 +3,6 @@ package protocol
 import "encoding/json"
 
 const (
-	TypeResize         = "resize"
 	TypeStdin          = "stdin"
 	TypeSessionStatus  = "session.status"
 	TypeControlRequest = "control.request"
@@ -19,11 +18,6 @@ type Envelope struct {
 
 type StdinPayload struct {
 	Data string `json:"data"`
-}
-
-type ResizePayload struct {
-	Cols uint16 `json:"cols"`
-	Rows uint16 `json:"rows"`
 }
 
 type ControlRequestPayload struct {

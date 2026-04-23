@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"strings"
 	"sync"
 
@@ -29,16 +28,14 @@ type Config struct {
 }
 
 type connectInfo struct {
-	SessionID        string
 	ViewerURL        string
 	HostWebSocketURL string
 }
 
 type createSessionResponse struct {
-	SessionID          string `json:"sessionId"`
-	ViewerURL          string `json:"viewerUrl"`
-	HostWebSocketURL   string `json:"hostWebSocketUrl"`
-	ViewerWebSocketURL string `json:"viewerWebSocketUrl"`
+	SessionID        string `json:"sessionId"`
+	ViewerURL        string `json:"viewerUrl"`
+	HostWebSocketURL string `json:"hostWebSocketUrl"`
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -80,10 +77,6 @@ func Run(ctx context.Context, cfg Config) error {
 	defer client.Close()
 
 	modal := newApprovalModal(os.Stdout)
-	if width, height, sizeErr := getTerminalSize(); sizeErr == nil {
-		modal.SetSize(width, height)
-		_ = terminal.Resize(uint16(width), uint16(height))
-	}
 
 	errCh := make(chan error, 4)
 	done := make(chan struct{})
@@ -169,7 +162,6 @@ func resolveConnection(ctx context.Context, cfg Config) (connectInfo, error) {
 	case "ws", "wss":
 		if cfg.SessionID == "" {
 			return connectInfo{
-				SessionID:        sessionIDFromPath(baseURL.Path),
 				ViewerURL:        viewerURLFromWebSocket(baseURL),
 				HostWebSocketURL: baseURL.String(),
 			}, nil
@@ -178,7 +170,6 @@ func resolveConnection(ctx context.Context, cfg Config) (connectInfo, error) {
 	case "http", "https":
 		if cfg.SessionID != "" {
 			return connectInfo{
-				SessionID:        cfg.SessionID,
 				ViewerURL:        resolveRelativeURL(baseURL, "/s/"+cfg.SessionID),
 				HostWebSocketURL: websocketURL(baseURL, "/api/session/"+cfg.SessionID+"/host"),
 			}, nil
@@ -213,7 +204,6 @@ func createSession(ctx context.Context, baseURL *url.URL) (connectInfo, error) {
 	}
 
 	return connectInfo{
-		SessionID:        created.SessionID,
 		ViewerURL:        resolveRelativeURL(baseURL, created.ViewerURL),
 		HostWebSocketURL: websocketURL(baseURL, created.HostWebSocketURL),
 	}, nil
@@ -259,15 +249,6 @@ func viewerURLFromWebSocket(websocketURL *url.URL) string {
 		viewer.Fragment = ""
 	}
 	return viewer.String()
-}
-
-func sessionIDFromPath(p string) string {
-	trimmed := strings.Trim(path.Clean(p), "/")
-	parts := strings.Split(trimmed, "/")
-	if len(parts) >= 3 {
-		return parts[2]
-	}
-	return ""
 }
 
 func streamPTYOutput(

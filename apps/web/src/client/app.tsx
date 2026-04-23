@@ -8,7 +8,14 @@ type SessionInfo = {
   viewerWebSocketUrl: string;
 };
 
+type BootstrapManifest = {
+  binaryBaseURL: string;
+  checksumsURL: string;
+  targets: Record<string, string>;
+};
+
 type SessionStatus = {
+  role: "host" | "viewer" | null;
   state: "idle" | "ready" | "active" | "closed";
   hostConnected: boolean;
   viewerCount: number;
@@ -21,6 +28,9 @@ type SessionStatus = {
     leaseSeconds: number;
   } | null;
   hasPendingControlRequest: boolean;
+  sessionExpiresAt: number | null;
+  hostDisconnectDeadline: number | null;
+  pendingRequestExpiresAt: number | null;
 };
 
 export function App() {
@@ -31,22 +41,23 @@ export function App() {
   const canWriteRef = useRef(false);
   const previousStatusRef = useRef<SessionStatus | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(readSessionId());
+  const [sessionInfo, setSessionInfo] = useState<SessionInfo | null>(() =>
+    buildSessionInfo(readSessionId()),
+  );
   const [sessionStatus, setSessionStatus] = useState<SessionStatus | null>(null);
+  const [bootstrapManifest, setBootstrapManifest] = useState<BootstrapManifest | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [creating, setCreating] = useState(false);
   const [requestingControl, setRequestingControl] = useState(false);
   const [statusNote, setStatusNote] = useState<string | null>(null);
   const [transportState, setTransportState] = useState("idle");
+  const [now, setNow] = useState(() => Date.now());
   const reconnectAttempts = useRef(0);
   const reconnectTimer = useRef<number | null>(null);
 
   const shareUrl = useMemo(() => {
-    if (!sessionId || typeof window === "undefined") {
-      return "";
-    }
-
-    return new URL(`/s/${sessionId}`, window.location.origin).toString();
-  }, [sessionId]);
+    return sessionInfo?.viewerUrl ?? "";
+  }, [sessionInfo]);
   const hostCommand = useMemo(() => {
     if (!sessionId || typeof window === "undefined") {
       return "";
@@ -68,10 +79,65 @@ export function App() {
 
     return `& ([ScriptBlock]::Create((irm '${window.location.origin}/start.ps1?session=${sessionId}')))`; 
   }, [sessionId]);
+  const bootstrapTargets = useMemo(() => {
+    if (!bootstrapManifest) {
+      return [];
+    }
+
+    return Object.entries(bootstrapManifest.targets).sort(([left], [right]) =>
+      left.localeCompare(right),
+    );
+  }, [bootstrapManifest]);
 
   useEffect(() => {
     canWriteRef.current = Boolean(sessionStatus?.canWrite);
   }, [sessionStatus?.canWrite]);
+
+  useEffect(() => {
+    setSessionInfo(buildSessionInfo(sessionId));
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadBootstrapManifest() {
+      try {
+        const response = await fetch("/api/bootstrap/manifest");
+        if (!response.ok) {
+          return;
+        }
+
+        const manifest = (await response.json()) as BootstrapManifest;
+        if (!cancelled) {
+          setBootstrapManifest(manifest);
+        }
+      } catch {
+        if (!cancelled) {
+          setBootstrapManifest(null);
+        }
+      }
+    }
+
+    void loadBootstrapManifest();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!terminalRef.current) {
@@ -156,7 +222,7 @@ export function App() {
 
       setSessionStatus(status);
 
-      const ws = new WebSocket(viewerSocketURL(sessionId));
+      const ws = new WebSocket(sessionInfo?.viewerWebSocketUrl ?? viewerSocketURL(sessionId));
       activeSocket = ws;
       socket.current = ws;
       const wasReconnect = reconnectAttempts.current > 0;
@@ -174,7 +240,6 @@ export function App() {
           setStatusNote(null);
         }
         reconnectAttempts.current = 0;
-        sendResize();
       });
 
       ws.addEventListener("message", (event) => {
@@ -266,18 +331,6 @@ export function App() {
       }
     }
 
-    function sendResize() {
-      if (socket.current?.readyState !== WebSocket.OPEN || !terminal.current) {
-        return;
-      }
-
-      const { cols, rows } = terminal.current.fit();
-      if (!canWriteRef.current) {
-        return;
-      }
-      socket.current.send(JSON.stringify({ type: "resize", payload: { cols, rows } }));
-    }
-
     function handleControlFrame(frame: Record<string, unknown>) {
       if (frame.type === "session.status") {
         const payload = frame.payload as SessionStatus;
@@ -319,12 +372,10 @@ export function App() {
     }
 
     void connectViewer();
-    window.addEventListener("resize", sendResize);
 
     return () => {
       cancelled = true;
       clearReconnectTimer();
-      window.removeEventListener("resize", sendResize);
       inputCleanup.current?.();
       inputCleanup.current = null;
       closeActiveSocket();
@@ -341,8 +392,9 @@ export function App() {
 
       const created = (await response.json()) as SessionInfo;
       setSessionId(created.sessionId);
+      setSessionInfo(normalizeSessionInfo(created));
       reconnectAttempts.current = 0;
-      window.history.replaceState({}, "", created.viewerUrl);
+      window.history.replaceState({}, "", normalizeSessionInfo(created).viewerUrl);
       previousStatusRef.current = null;
       setStatusNote(null);
       terminal.current?.clear();
@@ -368,10 +420,10 @@ export function App() {
   }
 
   const modeLabel = sessionStatus?.canWrite ? "Control granted" : "Read-only";
-  let leaseLabel: string | null = null;
-  if (sessionStatus?.canWrite && sessionStatus.controlLeaseExpiresAt) {
-    leaseLabel = new Date(sessionStatus.controlLeaseExpiresAt).toLocaleTimeString();
-  }
+  const leaseLabel = formatDeadline(sessionStatus?.controlLeaseExpiresAt ?? null, now);
+  const hostReconnectLabel = formatDeadline(sessionStatus?.hostDisconnectDeadline ?? null, now);
+  const requestDeadlineLabel = formatDeadline(sessionStatus?.pendingRequestExpiresAt ?? null, now);
+  const sessionExpiryLabel = formatDeadline(sessionStatus?.sessionExpiresAt ?? null, now);
   const canRequestControl =
     Boolean(sessionId) &&
     Boolean(sessionStatus?.hostConnected) &&
@@ -384,6 +436,8 @@ export function App() {
     requestControlLabel = "Control active";
   } else if (requestingControl) {
     requestControlLabel = "Request pending...";
+  } else if (sessionStatus?.hasPendingControlRequest) {
+    requestControlLabel = "Another request is pending";
   } else if (sessionStatus?.controllerViewerId) {
     requestControlLabel = "Another viewer is controlling";
   }
@@ -444,9 +498,35 @@ export function App() {
                 </dd>
               </div>
               <div>
+                <dt className="text-stone-500">Session state</dt>
+                <dd className="mt-1 text-stone-200">
+                  {sessionStatus?.state ?? "idle"}
+                </dd>
+              </div>
+              <div>
                 <dt className="text-stone-500">Control lease</dt>
                 <dd className="mt-1 text-stone-200">
-                  {leaseLabel ? `Until ${leaseLabel}` : "Not granted"}
+                  {leaseLabel ?? "Not granted"}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-stone-500">Host reconnect</dt>
+                <dd className="mt-1 text-stone-200">
+                  {!sessionStatus?.hostConnected && hostReconnectLabel
+                    ? hostReconnectLabel
+                    : "Not waiting"}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-stone-500">Request timeout</dt>
+                <dd className="mt-1 text-stone-200">
+                  {requestDeadlineLabel ?? "No pending request"}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-stone-500">Session expires</dt>
+                <dd className="mt-1 text-stone-200">
+                  {sessionExpiryLabel ?? "Unknown"}
                 </dd>
               </div>
             </dl>
@@ -501,6 +581,28 @@ export function App() {
                     "Create a session to get the PowerShell bootstrap command."}
                 </p>
               </div>
+              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
+                  Binary source
+                </p>
+                <p className="mt-2 break-all text-sm text-stone-200">
+                  {bootstrapManifest?.binaryBaseURL ?? "Loading bootstrap manifest..."}
+                </p>
+                <p className="mt-3 text-xs uppercase tracking-[0.22em] text-stone-500">
+                  Checksums
+                </p>
+                <p className="mt-2 break-all text-sm text-stone-200">
+                  {bootstrapManifest?.checksumsURL ?? "Loading bootstrap manifest..."}
+                </p>
+                <p className="mt-3 text-xs uppercase tracking-[0.22em] text-stone-500">
+                  Targets
+                </p>
+                <p className="mt-2 text-sm text-stone-200">
+                  {bootstrapTargets.length > 0
+                    ? bootstrapTargets.map(([target]) => target).join(", ")
+                    : "Loading bootstrap manifest..."}
+                </p>
+              </div>
               <button
                 type="button"
                 onClick={requestControl}
@@ -536,6 +638,70 @@ function readSessionId() {
 function viewerSocketURL(sessionId: string) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}/api/session/${sessionId}/viewer`;
+}
+
+function buildSessionInfo(sessionId: string | null): SessionInfo | null {
+  if (!sessionId || typeof window === "undefined") {
+    return null;
+  }
+
+  return normalizeSessionInfo({
+    sessionId,
+    viewerUrl: `/s/${sessionId}`,
+    hostWebSocketUrl: `/api/session/${sessionId}/host`,
+    viewerWebSocketUrl: `/api/session/${sessionId}/viewer`,
+  });
+}
+
+function normalizeSessionInfo(info: SessionInfo): SessionInfo {
+  if (typeof window === "undefined") {
+    return info;
+  }
+
+  const viewerUrl = new URL(info.viewerUrl, window.location.origin).toString();
+  const origin = new URL(viewerUrl).origin;
+  const viewerProtocol = origin.startsWith("https:") ? "wss:" : "ws:";
+  const hostProtocol = viewerProtocol;
+
+  return {
+    sessionId: info.sessionId,
+    viewerUrl,
+    hostWebSocketUrl: normalizeWebSocketURL(info.hostWebSocketUrl, hostProtocol),
+    viewerWebSocketUrl: normalizeWebSocketURL(info.viewerWebSocketUrl, viewerProtocol),
+  };
+}
+
+function normalizeWebSocketURL(value: string, protocol: string) {
+  if (value.startsWith("ws://") || value.startsWith("wss://")) {
+    return value;
+  }
+
+  if (typeof window === "undefined") {
+    return value;
+  }
+
+  const resolved = new URL(value, window.location.origin);
+  resolved.protocol = protocol;
+  return resolved.toString();
+}
+
+function formatDeadline(timestamp: number | null, now: number) {
+  if (!timestamp) {
+    return null;
+  }
+
+  const remainingMs = timestamp - now;
+  if (remainingMs <= 0) {
+    return "Expired";
+  }
+
+  const remainingSeconds = Math.ceil(remainingMs / 1000);
+  const minutes = Math.floor(remainingSeconds / 60);
+  const seconds = remainingSeconds % 60;
+  const relative =
+    minutes > 0 ? `${minutes}m ${String(seconds).padStart(2, "0")}s left` : `${seconds}s left`;
+
+  return `${new Date(timestamp).toLocaleTimeString()} (${relative})`;
 }
 
 function parseControlFrame(value: string): Record<string, unknown> | null {
