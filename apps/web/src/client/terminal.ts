@@ -3,10 +3,11 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 
 export type TerminalController = {
-  clear: () => void;
   dispose: () => void;
+  focus: () => void;
   fit: () => { cols: number; rows: number };
   onData: (handler: (value: string) => void) => () => void;
+  reset: () => void;
   write: (value: string) => void;
   writeln: (value: string) => void;
 };
@@ -29,19 +30,44 @@ export function mountTerminal(container: HTMLElement): TerminalController {
   terminal.open(container);
   fit.fit();
 
-  const resizeObserver = new ResizeObserver(() => {
-    fit.fit();
-  });
+  let resizeTimer = 0;
+  let lastWidth = Math.round(container.clientWidth);
+  let lastHeight = Math.round(container.clientHeight);
 
-  resizeObserver.observe(container);
+  function scheduleFit(width: number, height: number) {
+    if (width === lastWidth && height === lastHeight) {
+      return;
+    }
+
+    lastWidth = width;
+    lastHeight = height;
+
+    if (resizeTimer) {
+      window.clearTimeout(resizeTimer);
+    }
+
+    resizeTimer = window.setTimeout(() => {
+      resizeTimer = 0;
+      fit.fit();
+    }, 160);
+  }
+
+  function handleWindowResize() {
+    scheduleFit(Math.round(container.clientWidth), Math.round(container.clientHeight));
+  }
+
+  window.addEventListener("resize", handleWindowResize);
 
   return {
-    clear() {
-      terminal.clear();
-    },
     dispose() {
-      resizeObserver.disconnect();
+      window.removeEventListener("resize", handleWindowResize);
+      if (resizeTimer) {
+        window.clearTimeout(resizeTimer);
+      }
       terminal.dispose();
+    },
+    focus() {
+      terminal.focus();
     },
     fit() {
       fit.fit();
@@ -55,6 +81,10 @@ export function mountTerminal(container: HTMLElement): TerminalController {
       return () => {
         disposable.dispose();
       };
+    },
+    reset() {
+      terminal.reset();
+      fit.fit();
     },
     write(value) {
       terminal.write(value);

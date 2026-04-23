@@ -8,12 +8,6 @@ type SessionInfo = {
   viewerWebSocketUrl: string;
 };
 
-type BootstrapManifest = {
-  binaryBaseURL: string;
-  checksumsURL: string;
-  targets: Record<string, string>;
-};
-
 type SessionStatus = {
   role: "host" | "viewer" | null;
   state: "idle" | "ready" | "active" | "closed";
@@ -33,6 +27,10 @@ type SessionStatus = {
   pendingRequestExpiresAt: number | null;
 };
 
+type PlatformTab = "macos" | "linux" | "windows";
+type TransportState = "idle" | "connecting" | "connected" | "reconnecting" | "closed" | "error";
+type CopyLabel = "Copy" | "Copied" | "Copy failed";
+
 export function App() {
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const terminal = useRef<TerminalController | null>(null);
@@ -41,30 +39,26 @@ export function App() {
   const canWriteRef = useRef(false);
   const previousStatusRef = useRef<SessionStatus | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(readSessionId());
-  const [sessionInfo, setSessionInfo] = useState<SessionInfo | null>(() =>
-    buildSessionInfo(readSessionId()),
-  );
   const [sessionStatus, setSessionStatus] = useState<SessionStatus | null>(null);
-  const [bootstrapManifest, setBootstrapManifest] = useState<BootstrapManifest | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [creating, setCreating] = useState(false);
   const [requestingControl, setRequestingControl] = useState(false);
+  const [selectedPlatform, setSelectedPlatform] = useState<PlatformTab>(() => detectPlatformTab());
   const [statusNote, setStatusNote] = useState<string | null>(null);
-  const [transportState, setTransportState] = useState("idle");
+  const [shareCopyLabel, setShareCopyLabel] = useState<CopyLabel>("Copy");
+  const [platformCopyLabel, setPlatformCopyLabel] = useState<CopyLabel>("Copy");
+  const [transportState, setTransportState] = useState<TransportState>("idle");
   const [now, setNow] = useState(() => Date.now());
   const reconnectAttempts = useRef(0);
   const reconnectTimer = useRef<number | null>(null);
+  const suppressReconnectRef = useRef(false);
+  const shareCopyTimerRef = useRef<number | null>(null);
+  const platformCopyTimerRef = useRef<number | null>(null);
+  const sessionInfo = useMemo(() => buildSessionInfo(sessionId), [sessionId]);
 
   const shareUrl = useMemo(() => {
     return sessionInfo?.viewerUrl ?? "";
   }, [sessionInfo]);
-  const hostCommand = useMemo(() => {
-    if (!sessionId || typeof window === "undefined") {
-      return "";
-    }
-
-    return `cd agent && go run ./cmd/ttys-agent -server ${window.location.origin} -session ${sessionId}`;
-  }, [sessionId]);
   const shellBootstrapCommand = useMemo(() => {
     if (!sessionId || typeof window === "undefined") {
       return "";
@@ -79,23 +73,27 @@ export function App() {
 
     return `& ([ScriptBlock]::Create((irm '${window.location.origin}/start.ps1?session=${sessionId}')))`; 
   }, [sessionId]);
-  const bootstrapTargets = useMemo(() => {
-    if (!bootstrapManifest) {
-      return [];
+  const platformCommand = useMemo(() => {
+    if (selectedPlatform === "windows") {
+      return powershellBootstrapCommand;
     }
-
-    return Object.entries(bootstrapManifest.targets).sort(([left], [right]) =>
-      left.localeCompare(right),
-    );
-  }, [bootstrapManifest]);
+    return shellBootstrapCommand;
+  }, [powershellBootstrapCommand, selectedPlatform, shellBootstrapCommand]);
 
   useEffect(() => {
     canWriteRef.current = Boolean(sessionStatus?.canWrite);
   }, [sessionStatus?.canWrite]);
 
   useEffect(() => {
-    setSessionInfo(buildSessionInfo(sessionId));
-  }, [sessionId]);
+    return () => {
+      if (shareCopyTimerRef.current !== null) {
+        window.clearTimeout(shareCopyTimerRef.current);
+      }
+      if (platformCopyTimerRef.current !== null) {
+        window.clearTimeout(platformCopyTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!sessionId) {
@@ -110,34 +108,6 @@ export function App() {
       window.clearInterval(timer);
     };
   }, [sessionId]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function loadBootstrapManifest() {
-      try {
-        const response = await fetch("/api/bootstrap/manifest");
-        if (!response.ok) {
-          return;
-        }
-
-        const manifest = (await response.json()) as BootstrapManifest;
-        if (!cancelled) {
-          setBootstrapManifest(manifest);
-        }
-      } catch {
-        if (!cancelled) {
-          setBootstrapManifest(null);
-        }
-      }
-    }
-
-    void loadBootstrapManifest();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     if (!terminalRef.current) {
@@ -263,7 +233,7 @@ export function App() {
         if (socket.current === ws) {
           socket.current = null;
         }
-        if (cancelled) {
+        if (cancelled || suppressReconnectRef.current) {
           return;
         }
         setTransportState("reconnecting");
@@ -341,6 +311,7 @@ export function App() {
               ? new Date(payload.controlLeaseExpiresAt).toLocaleTimeString()
               : "the lease expires";
             setStatusNote(`Control granted. Lease active until ${leaseUntil}.`);
+            terminal.current?.focus();
           } else if (previous.canWrite && !payload.canWrite) {
             setStatusNote(
               payload.controllerViewerId && payload.controllerViewerId !== payload.viewerId
@@ -391,17 +362,82 @@ export function App() {
       }
 
       const created = (await response.json()) as SessionInfo;
+      suppressReconnectRef.current = true;
+      if (reconnectTimer.current !== null) {
+        window.clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = null;
+      }
+      inputCleanup.current?.();
+      inputCleanup.current = null;
+      socket.current?.close();
+      socket.current = null;
+      const createdInfo = normalizeSessionInfo(created);
       setSessionId(created.sessionId);
-      setSessionInfo(normalizeSessionInfo(created));
       reconnectAttempts.current = 0;
-      window.history.replaceState({}, "", normalizeSessionInfo(created).viewerUrl);
+      window.history.replaceState({}, "", createdInfo.viewerUrl);
       previousStatusRef.current = null;
       setStatusNote(null);
-      terminal.current?.clear();
+      setSessionStatus(null);
+      setTransportState("idle");
+      setConnecting(false);
+      terminal.current?.reset();
       terminal.current?.writeln("Session created.");
       terminal.current?.writeln("Waiting for host agent to attach...");
     } finally {
+      suppressReconnectRef.current = false;
       setCreating(false);
+    }
+  }
+
+  async function handleCopy(
+    value: string,
+    setState: (value: CopyLabel) => void,
+    timerRef: { current: number | null },
+  ) {
+    if (!value) {
+      return;
+    }
+
+    setState((await copyText(value)) ? "Copied" : "Copy failed");
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+    }
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      setState("Copy");
+    }, 2000);
+  }
+
+  async function copyText(value: string) {
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(value);
+        return true;
+      } catch {
+        // Fall back to execCommand below.
+      }
+    }
+
+    if (typeof document === "undefined") {
+      return false;
+    }
+
+    try {
+      const textarea = document.createElement("textarea");
+      textarea.value = value;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      textarea.style.pointerEvents = "none";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      textarea.setSelectionRange(0, textarea.value.length);
+      const copied = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      return copied;
+    } catch {
+      return false;
     }
   }
 
@@ -421,9 +457,8 @@ export function App() {
 
   const modeLabel = sessionStatus?.canWrite ? "Control granted" : "Read-only";
   const leaseLabel = formatDeadline(sessionStatus?.controlLeaseExpiresAt ?? null, now);
-  const hostReconnectLabel = formatDeadline(sessionStatus?.hostDisconnectDeadline ?? null, now);
-  const requestDeadlineLabel = formatDeadline(sessionStatus?.pendingRequestExpiresAt ?? null, now);
   const sessionExpiryLabel = formatDeadline(sessionStatus?.sessionExpiresAt ?? null, now);
+  const connectionLabel = transportLabel(transportState);
   const canRequestControl =
     Boolean(sessionId) &&
     Boolean(sessionStatus?.hostConnected) &&
@@ -445,92 +480,68 @@ export function App() {
   return (
     <main className="min-h-screen bg-stone-950 text-stone-100">
       <section className="mx-auto flex min-h-screen max-w-6xl flex-col px-6 py-8">
-        <header className="mb-6 flex items-center justify-between gap-4">
+        <header className="mb-6 flex items-start justify-between gap-4">
           <div>
             <p className="text-xs uppercase tracking-[0.32em] text-amber-400">
               ttys
             </p>
-            <h1 className="mt-2 text-3xl font-semibold tracking-tight">
-              Cloudflare-backed shared terminal
+            <h1 className="mt-2 text-xl font-medium tracking-tight text-stone-200">
+              Live terminal sharing
             </h1>
           </div>
-          <div className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-sm text-emerald-300">
-            {transportState}
+          <div className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300">
+            {connectionLabel}
           </div>
         </header>
 
         <div className="grid gap-6 lg:grid-cols-[300px_minmax(0,1fr)]">
-          <aside className="rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
-            <h2 className="text-sm font-medium uppercase tracking-[0.24em] text-stone-400">
-              Status
-            </h2>
-            <dl className="mt-4 space-y-4 text-sm">
-              <div>
-                <dt className="text-stone-500">Session</dt>
-                <dd className="mt-1 text-stone-200">Anonymous short session</dd>
-              </div>
-              <div>
-                <dt className="text-stone-500">Transport</dt>
-                <dd className="mt-1 text-stone-200">Worker + Durable Object</dd>
-              </div>
-              <div>
-                <dt className="text-stone-500">Session ID</dt>
-                <dd className="mt-1 break-all text-stone-200">
-                  {sessionId ?? "Not created"}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-stone-500">Host</dt>
+          <aside className="min-w-0 rounded-3xl border border-white/10 bg-black/30 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-sm font-medium uppercase tracking-[0.24em] text-stone-400">
+                Status
+              </h2>
+              <button
+                type="button"
+                onClick={() => void createSession()}
+                disabled={creating}
+                className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-stone-300 transition hover:bg-white/10 hover:text-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {creating ? "Creating..." : sessionId ? "New session" : "Create session"}
+              </button>
+            </div>
+            <dl className="mt-3 grid grid-cols-2 gap-3 text-sm">
+              <div className="rounded-2xl border border-white/8 bg-black/15 p-3">
+                <dt className="text-xs uppercase tracking-[0.18em] text-stone-500">Host</dt>
                 <dd className="mt-1 text-stone-200">
                   {sessionStatus?.hostConnected ? "Connected" : "Waiting"}
                 </dd>
               </div>
-              <div>
-                <dt className="text-stone-500">Viewers</dt>
+              <div className="rounded-2xl border border-white/8 bg-black/15 p-3">
+                <dt className="text-xs uppercase tracking-[0.18em] text-stone-500">Viewers</dt>
                 <dd className="mt-1 text-stone-200">
                   {sessionStatus?.viewerCount ?? 0}
                 </dd>
               </div>
-              <div>
-                <dt className="text-stone-500">Mode</dt>
+              <div className="rounded-2xl border border-white/8 bg-black/15 p-3">
+                <dt className="text-xs uppercase tracking-[0.18em] text-stone-500">Mode</dt>
                 <dd className="mt-1 text-stone-200">
                   {connecting ? "Connecting" : modeLabel}
                 </dd>
               </div>
-              <div>
-                <dt className="text-stone-500">Session state</dt>
-                <dd className="mt-1 text-stone-200">
-                  {sessionStatus?.state ?? "idle"}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-stone-500">Control lease</dt>
+              <div className="rounded-2xl border border-white/8 bg-black/15 p-3">
+                <dt className="text-xs uppercase tracking-[0.18em] text-stone-500">Lease</dt>
                 <dd className="mt-1 text-stone-200">
                   {leaseLabel ?? "Not granted"}
                 </dd>
               </div>
-              <div>
-                <dt className="text-stone-500">Host reconnect</dt>
-                <dd className="mt-1 text-stone-200">
-                  {!sessionStatus?.hostConnected && hostReconnectLabel
-                    ? hostReconnectLabel
-                    : "Not waiting"}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-stone-500">Request timeout</dt>
-                <dd className="mt-1 text-stone-200">
-                  {requestDeadlineLabel ?? "No pending request"}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-stone-500">Session expires</dt>
+              <div className="col-span-2 rounded-2xl border border-white/8 bg-black/15 p-3">
+                <dt className="text-xs uppercase tracking-[0.18em] text-stone-500">Expires</dt>
                 <dd className="mt-1 text-stone-200">
                   {sessionExpiryLabel ?? "Unknown"}
                 </dd>
               </div>
             </dl>
-            <div className="mt-6 space-y-3">
+            <div className="mt-4 space-y-3">
               <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
                 <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
                   Access
@@ -539,85 +550,84 @@ export function App() {
                   {statusNote ??
                     "Viewers are read-only by default. Request control to type into the host shell."}
                 </p>
+                <button
+                  type="button"
+                  onClick={requestControl}
+                  disabled={!canRequestControl || requestingControl}
+                  className="mt-3 w-full rounded-2xl border border-sky-400/30 bg-sky-500/10 px-4 py-3 text-sm font-medium text-sky-200 transition hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {requestControlLabel}
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={() => void createSession()}
-                disabled={creating}
-                className="w-full rounded-2xl bg-amber-400 px-4 py-3 text-sm font-medium text-stone-950 transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {creating ? "Creating..." : sessionId ? "New session" : "Create session"}
-              </button>
-              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-                <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
-                  Share URL
-                </p>
-                <p className="mt-2 break-all text-sm text-stone-200">
+              <div className="min-w-0 rounded-2xl border border-white/10 bg-black/20 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
+                    Share URL
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleCopy(shareUrl, setShareCopyLabel, shareCopyTimerRef)
+                    }
+                    disabled={!shareUrl}
+                    className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-stone-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {shareCopyLabel}
+                  </button>
+                </div>
+                <p className="mt-2 min-w-0 max-w-full overflow-x-auto whitespace-nowrap rounded-xl border border-white/8 bg-black/20 px-3 py-2 text-sm text-stone-200">
                   {shareUrl || "Create a session to get a shareable URL."}
                 </p>
               </div>
-              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-                <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
-                  Host command
-                </p>
-                <p className="mt-2 break-all font-mono text-sm text-stone-200">
-                  {hostCommand || "Create a session to get a host attach command."}
-                </p>
-              </div>
-              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-                <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
-                  Unix bootstrap
-                </p>
-                <p className="mt-2 break-all font-mono text-sm text-stone-200">
-                  {shellBootstrapCommand || "Create a session to get the curl bootstrap command."}
-                </p>
-              </div>
-              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-                <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
-                  PowerShell bootstrap
-                </p>
-                <p className="mt-2 break-all font-mono text-sm text-stone-200">
-                  {powershellBootstrapCommand ||
-                    "Create a session to get the PowerShell bootstrap command."}
-                </p>
-              </div>
-              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-                <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
-                  Binary source
-                </p>
-                <p className="mt-2 break-all text-sm text-stone-200">
-                  {bootstrapManifest?.binaryBaseURL ?? "Loading bootstrap manifest..."}
-                </p>
-                <p className="mt-3 text-xs uppercase tracking-[0.22em] text-stone-500">
-                  Checksums
-                </p>
-                <p className="mt-2 break-all text-sm text-stone-200">
-                  {bootstrapManifest?.checksumsURL ?? "Loading bootstrap manifest..."}
-                </p>
-                <p className="mt-3 text-xs uppercase tracking-[0.22em] text-stone-500">
-                  Targets
-                </p>
-                <p className="mt-2 text-sm text-stone-200">
-                  {bootstrapTargets.length > 0
-                    ? bootstrapTargets.map(([target]) => target).join(", ")
-                    : "Loading bootstrap manifest..."}
+              <div className="min-w-0 rounded-2xl border border-white/10 bg-black/20 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
+                    Start host
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleCopy(
+                        platformCommand,
+                        setPlatformCopyLabel,
+                        platformCopyTimerRef,
+                      )
+                    }
+                    disabled={!platformCommand}
+                    className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-stone-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {platformCopyLabel}
+                  </button>
+                </div>
+                <div className="mt-3 grid grid-cols-3 rounded-2xl border border-white/10 bg-black/30 p-1">
+                  <PlatformButton
+                    active={selectedPlatform === "macos"}
+                    label="macOS"
+                    onClick={() => setSelectedPlatform("macos")}
+                  />
+                  <PlatformButton
+                    active={selectedPlatform === "linux"}
+                    label="Linux"
+                    onClick={() => setSelectedPlatform("linux")}
+                  />
+                  <PlatformButton
+                    active={selectedPlatform === "windows"}
+                    label="Windows"
+                    onClick={() => setSelectedPlatform("windows")}
+                  />
+                </div>
+                <p className="mt-3 min-w-0 max-w-full overflow-x-auto whitespace-nowrap rounded-xl border border-white/8 bg-black/20 px-3 py-2 font-mono text-sm text-stone-200">
+                  {platformCommand ||
+                    "Create a session to get the bootstrap command for this platform."}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={requestControl}
-                disabled={!canRequestControl || requestingControl}
-                className="w-full rounded-2xl border border-sky-400/30 bg-sky-500/10 px-4 py-3 text-sm font-medium text-sky-200 transition hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {requestControlLabel}
-              </button>
             </div>
           </aside>
 
-          <section className="rounded-3xl border border-white/10 bg-black/50 p-3 shadow-2xl shadow-black/40">
+          <section className="min-w-0 rounded-3xl border border-white/10 bg-black/50 p-3 shadow-2xl shadow-black/40 lg:sticky lg:top-6 lg:self-start">
             <div
               ref={terminalRef}
-              className="h-[70vh] overflow-hidden rounded-2xl border border-white/10 bg-[#111111]"
+              className="min-w-0 h-[70vh] min-h-[24rem] overflow-hidden rounded-2xl border border-white/10 bg-[#111111] lg:h-[calc(100vh-8rem)]"
             />
           </section>
         </div>
@@ -633,6 +643,45 @@ function readSessionId() {
 
   const match = window.location.pathname.match(/^\/s\/([^/]+)$/);
   return match?.[1] ?? null;
+}
+
+function PlatformButton({
+  active,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded-xl px-3 py-2 text-sm transition ${
+        active
+          ? "bg-white text-stone-950 shadow-sm"
+          : "text-stone-400 hover:text-stone-200"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function detectPlatformTab(): PlatformTab {
+  if (typeof window === "undefined") {
+    return "macos";
+  }
+
+  const platform = window.navigator.userAgent.toLowerCase();
+  if (platform.includes("win")) {
+    return "windows";
+  }
+  if (platform.includes("linux")) {
+    return "linux";
+  }
+  return "macos";
 }
 
 function viewerSocketURL(sessionId: string) {
@@ -702,6 +751,23 @@ function formatDeadline(timestamp: number | null, now: number) {
     minutes > 0 ? `${minutes}m ${String(seconds).padStart(2, "0")}s left` : `${seconds}s left`;
 
   return `${new Date(timestamp).toLocaleTimeString()} (${relative})`;
+}
+
+function transportLabel(value: string) {
+  switch (value) {
+    case "connected":
+      return "Live";
+    case "connecting":
+      return "Connecting";
+    case "reconnecting":
+      return "Reconnecting";
+    case "closed":
+      return "Offline";
+    case "error":
+      return "Connection issue";
+    default:
+      return "Idle";
+  }
 }
 
 function parseControlFrame(value: string): Record<string, unknown> | null {
