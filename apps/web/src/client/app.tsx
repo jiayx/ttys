@@ -78,7 +78,7 @@ export function App() {
       return "";
     }
 
-    return `& ([ScriptBlock]::Create((irm '${window.location.origin}/start.ps1?session=${sessionId}')))`; 
+    return `& ([ScriptBlock]::Create((irm '${window.location.origin}/start.ps1?session=${sessionId}')))`;
   }, [sessionId]);
   const platformCommand = useMemo(() => {
     if (selectedPlatform === "windows") {
@@ -137,6 +137,7 @@ export function App() {
       return;
     }
 
+    const currentSessionId = sessionId;
     let cancelled = false;
     let activeSocket: WebSocket | null = null;
 
@@ -199,7 +200,9 @@ export function App() {
 
       setSessionStatus(status);
 
-      const ws = new WebSocket(sessionInfo?.viewerWebSocketUrl ?? viewerSocketURL(sessionId));
+      const ws = new WebSocket(
+        sessionInfo?.viewerWebSocketUrl ?? viewerSocketURL(currentSessionId),
+      );
       activeSocket = ws;
       socket.current = ws;
       const wasReconnect = reconnectAttempts.current > 0;
@@ -673,7 +676,7 @@ export function App() {
           <section className="min-w-0 rounded-3xl border border-white/10 bg-black/50 p-3 shadow-2xl shadow-black/40 lg:sticky lg:top-6 lg:self-start">
             <div
               ref={terminalRef}
-              className="min-w-0 h-[70vh] min-h-[24rem] overflow-hidden rounded-2xl border border-white/10 bg-[#111111] lg:h-[calc(100vh-8rem)]"
+              className="min-w-0 h-[70vh] min-h-96 overflow-hidden rounded-2xl border border-white/10 bg-[#111111] lg:h-[calc(100vh-8rem)]"
             />
           </section>
         </div>
