@@ -2,30 +2,35 @@
 
 Anonymous shared terminal over Cloudflare Workers and Durable Objects.
 
-## Stack
+## Components
 
-- Host agent: Go
-- Web: Vite 8 + TypeScript + React
-- Worker runtime: Cloudflare Workers + Durable Objects
-- Styling: Tailwind CSS
+- `apps/web`: React + Vite frontend and Cloudflare Worker
+- `agent`: Go host agent
+- `agent-zig`: Zig host agent
+- `scripts`: local development and bootstrap helpers
 
-## Layout
+## Current State
 
-- `apps/web`: frontend and Worker code
-- `agent`: local host bridge
-- `scripts`: bootstrap scripts for macOS, Linux, and Windows
+- The web app can create a session, attach viewers, and bridge host/viewer websocket traffic through the Worker.
+- The Go agent is the main implementation.
+- The Zig agent is being brought up against the Go behavior. It currently builds on macOS, Windows, and Linux portable/system targets, but it should still be treated as under validation rather than fully parity-complete.
 
-## Current status
+## Repository Layout
 
-- Browser UI can create a session and attach as a viewer on `/s/:sessionId`
-- Worker and Durable Object can create a session, expose host/viewer websocket routes, and fan out host output to viewers
-- Viewers are read-only by default and can request control; the host must approve the request locally, and control is granted for a 30 minute lease
-- The Go agent turns the current terminal window into the shared session frontend, keeps the PTY one row shorter, and reserves the last row for a local status bar
-- The local status bar stays visible, shows viewers/control/session lifecycle state, and uses `Ctrl-G` as the local action prefix
-- Sessions expire automatically after 2 hours, pending control requests expire after 30 seconds, and host disconnects get a 60 second reconnection grace period
-- Windows builds now use ConPTY instead of the previous stub
+- `apps/web`: browser UI, Worker routes, Durable Object logic
+- `agent/cmd/ttys-agent`: Go CLI entrypoint
+- `agent/internal`: Go PTY, websocket transport, platform handling, session flow
+- `agent-zig/src`: Zig PTY, transport, terminal, and session flow
+- `.github/workflows/build-agents.yml`: CI build matrix for Go and Zig release assets
 
-## Local development
+## Requirements
+
+- Node.js with `pnpm`
+- Go `1.24.2` or compatible toolchain
+- Zig `0.16.0` for `agent-zig`
+- A Cloudflare account for deployment
+
+## Web Development
 
 Install dependencies:
 
@@ -45,77 +50,130 @@ Build the web app:
 pnpm build
 ```
 
-Build the Go agent:
+Deploy the Worker:
+
+```bash
+pnpm deploy
+```
+
+## Go Agent
+
+Build:
 
 ```bash
 cd agent
 go build ./...
 ```
 
-## Manual host flow
-
-Run the agent against the local dev server base URL and let it create a session automatically:
+Run against a local server:
 
 ```bash
-./scripts/start.sh http://127.0.0.1:8787
+./scripts/start.sh http://127.0.0.1:5173
 ```
 
-The agent will print the session id and the share URL.
+Attach to an existing session:
 
-By default, everyone opening the share URL is read-only. A viewer must request control from the browser, and the host terminal can respond with local actions without leaving the shared session view.
-The browser UI will show explicit access notes when a control request is pending, granted, declined, revoked, or expired.
-The Worker also exposes bootstrap entrypoints at `/start` and `/start.ps1`, plus `/api/bootstrap/manifest` for platform download URLs.
+```bash
+./scripts/start.sh http://127.0.0.1:5173 <session-id>
+```
 
-The host terminal uses a single-line local status bar and `Ctrl-G` action prefix:
+Windows PowerShell entrypoint:
 
-- `Ctrl-G a`: approve the pending control request
-- `Ctrl-G d`: deny the pending control request
-- `Ctrl-G r`: revoke the current controller
-- `Ctrl-G s`: show an expanded status summary in the status bar
-- `Ctrl-G q`: cancel local action mode
+```powershell
+./scripts/start.ps1 -Server http://127.0.0.1:5173
+```
 
-## Bootstrap distribution
+Direct Go CLI usage:
 
-- `GET /start`: Unix bootstrap script for `curl | sh`
-- `GET /start.ps1`: PowerShell bootstrap script
-- `GET /api/bootstrap/manifest`: platform-to-binary URL manifest
+```bash
+cd agent
+go run ./cmd/ttys-agent -server http://127.0.0.1:5173
+```
 
-By default, bootstrap scripts download binaries from `${origin}/downloads/local/...`. For local testing, build the current machine's agent into that directory:
+Flags:
+
+- `-server`: HTTP base URL or direct host websocket URL
+- `-session`: existing session ID when using an HTTP server URL
+- `-shell`: shell to launch
+
+## Zig Agent
+
+Build the default native target:
+
+```bash
+cd agent-zig
+zig build
+```
+
+Build Windows:
+
+```bash
+cd agent-zig
+zig build -Dtarget=x86_64-windows-gnu
+```
+
+Build Linux portable:
+
+```bash
+cd agent-zig
+zig build -Dtarget=x86_64-linux-gnu -Dlinux_transport=portable
+```
+
+Build Linux system transport:
+
+```bash
+cd agent-zig
+zig build -Dtarget=x86_64-linux-gnu -Dlinux_transport=system
+```
+
+Notes:
+
+- macOS uses system `libcurl` for websocket transport.
+- Linux has two Zig transport variants:
+  - `system`: depends on system `libcurl`
+  - `portable`: avoids `libcurl` for websocket transport
+- Windows uses `WinHTTP` plus `ConPTY`; this path builds successfully but still needs more runtime validation.
+
+## Local Bootstrap Assets
+
+Build a local Go agent into the web download directory:
 
 ```bash
 ./scripts/build-local-agent.sh
 ```
 
-The local build script emits a platform-specific asset name plus `checksums.txt`, and the bootstrap scripts verify SHA-256 before execution.
+This writes the current machine's Go agent binary to:
 
-For production, you can either set:
+- `apps/web/public/downloads/local/ttys-agent-<os>-<arch>[.exe]`
+- `apps/web/public/downloads/local/checksums.txt`
 
-- `BOOTSTRAP_BINARY_BASE_URL`
-- `BOOTSTRAP_CHECKSUMS_URL`
+## CI and Releases
 
-or let the Worker derive GitHub Releases URLs from:
+GitHub Actions workflow:
 
-- `BOOTSTRAP_GITHUB_REPOSITORY`
-- `BOOTSTRAP_GITHUB_TAG`
+- `.github/workflows/build-agents.yml`
 
-In that mode, the Worker will serve bootstrap scripts that download `ttys-agent-<os>-<arch>[.exe]` plus `checksums.txt` from the matching GitHub release.
+It builds:
 
-You can still attach to an existing session:
+- Go:
+  - `ttys-agent-darwin-amd64`
+  - `ttys-agent-darwin-arm64`
+  - `ttys-agent-linux-amd64`
+  - `ttys-agent-linux-arm64`
+  - `ttys-agent-windows-amd64.exe`
+- Zig:
+  - `ttys-agent-zig-darwin-amd64`
+  - `ttys-agent-zig-darwin-arm64`
+  - `ttys-agent-zig-linux-amd64-system`
+  - `ttys-agent-zig-linux-amd64-portable`
+  - `ttys-agent-zig-linux-arm64-system`
+  - `ttys-agent-zig-linux-arm64-portable`
+  - `ttys-agent-zig-windows-amd64.exe`
 
-```bash
-./scripts/start.sh http://127.0.0.1:8787 <session-id>
-```
+On `v*` tags, the workflow also publishes all assets plus `checksums.txt` to GitHub Releases.
 
-Or bypass session creation entirely with a direct websocket endpoint:
+## Status Guidance
 
-```bash
-cd agent
-go run ./cmd/ttys-agent -server ws://127.0.0.1:8787/api/session/<session-id>/host
-```
+If you want the most conservative path today, use the Go agent.
 
-## Next steps
-
-1. Replace the placeholder bootstrap scripts with real platform detection and binary download
-2. Implement read-only vs control tokens
-3. Add Windows ConPTY support
-4. Replace the dev-only host command in the browser with the real one-line bootstrap command
+If you want the smallest Zig binary with fewer external dependencies on Linux, prefer the Zig `portable` variant.

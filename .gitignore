@@ -8,6 +8,7 @@ agent/bin
 
 .cache/
 agent/.cache/
-apps/web/public/downloads/local/ttys-agent
-apps/web/public/downloads/local/ttys-agent-*
-apps/web/public/downloads/local/checksums.txt
+apps/web/public/downloads/local/
+.zig-cache/
+.zig-cache-global/
+zig-out/
