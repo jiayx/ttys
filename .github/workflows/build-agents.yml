@@ -69,19 +69,19 @@ jobs:
         include:
           - id: darwin-amd64
             runner: macos-13
-            target: x86_64-macos
+            target: ""
             linux_transport: ""
             ext: ""
             asset: ttys-agent-zig-darwin-amd64
           - id: darwin-arm64
             runner: macos-14
-            target: aarch64-macos
+            target: ""
             linux_transport: ""
             ext: ""
             asset: ttys-agent-zig-darwin-arm64
           - id: linux-amd64-system
             runner: ubuntu-latest
-            target: x86_64-linux-gnu
+            target: ""
             linux_transport: system
             ext: ""
             asset: ttys-agent-zig-linux-amd64-system
@@ -93,7 +93,7 @@ jobs:
             asset: ttys-agent-zig-linux-amd64-portable
           - id: linux-arm64-system
             runner: ubuntu-24.04-arm
-            target: aarch64-linux-gnu
+            target: ""
             linux_transport: system
             ext: ""
             asset: ttys-agent-zig-linux-arm64-system
@@ -134,10 +134,13 @@ jobs:
           cd agent-zig
 
           args=(
-            "-Dtarget=${{ matrix.target }}"
             "--summary"
             "all"
           )
+
+          if [[ -n "${{ matrix.target }}" ]]; then
+            args=("-Dtarget=${{ matrix.target }}" "${args[@]}")
+          fi
 
           if [[ -n "${{ matrix.linux_transport }}" ]]; then
             args+=("-Dlinux_transport=${{ matrix.linux_transport }}")
