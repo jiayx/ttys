@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"unsafe"
 
@@ -48,7 +49,13 @@ type Session struct {
 	processID uint32
 }
 
-func Start(shell string) (*Session, error) {
+type LaunchConfig struct {
+	Path string
+	Args []string
+	Env  []string
+}
+
+func Start(cfg LaunchConfig) (*Session, error) {
 	inRead, inWrite, err := createPipePair()
 	if err != nil {
 		return nil, err
@@ -80,10 +87,21 @@ func Start(shell string) (*Session, error) {
 	siEx.attributeList = attrList
 
 	var pi windows.ProcessInformation
-	commandLine, err := windows.UTF16PtrFromString(quotedCommand(shell))
+	commandLine, err := windows.UTF16PtrFromString(buildCommandLine(cfg.Path, cfg.Args))
 	if err != nil {
 		closePseudoConsole(console)
 		return nil, err
+	}
+
+	var envBlock *uint16
+	creationFlags := uint32(extendedStartupInfoPresent)
+	if len(cfg.Env) > 0 {
+		envBlock, err = windows.UTF16PtrFromString(strings.Join(cfg.Env, "\x00") + "\x00")
+		if err != nil {
+			closePseudoConsole(console)
+			return nil, err
+		}
+		creationFlags |= windows.CREATE_UNICODE_ENVIRONMENT
 	}
 
 	if err := windows.CreateProcess(
@@ -92,8 +110,8 @@ func Start(shell string) (*Session, error) {
 		nil,
 		nil,
 		false,
-		extendedStartupInfoPresent,
-		nil,
+		creationFlags,
+		envBlock,
 		nil,
 		&siEx.StartupInfo,
 		&pi,
@@ -250,9 +268,15 @@ func newAttributeList(console pseudoConsole) (*byte, func(), error) {
 	}, nil
 }
 
-func quotedCommand(shell string) string {
-	if strings.ContainsAny(shell, " \t") {
-		return `"` + shell + `"`
+func buildCommandLine(path string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, quoteArg(path))
+	for _, arg := range args {
+		parts = append(parts, quoteArg(arg))
 	}
-	return shell
+	return strings.Join(parts, " ")
+}
+
+func quoteArg(value string) string {
+	return strconv.Quote(value)
 }

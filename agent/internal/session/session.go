@@ -13,7 +13,8 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"time"
+
+	"golang.org/x/term"
 
 	"github.com/jiayx/ttys/agent/internal/platform"
 	"github.com/jiayx/ttys/agent/internal/protocol"
@@ -27,97 +28,6 @@ type Config struct {
 	Shell     string
 }
 
-func Run(ctx context.Context, cfg Config) error {
-	select {
-	case <-ctx.Done():
-		return nil
-	default:
-	}
-
-	shell := cfg.Shell
-	if shell == "" {
-		shell = platform.DefaultShell()
-	}
-
-	connectInfo, err := resolveConnection(ctx, cfg)
-	if err != nil {
-		return err
-	}
-
-	terminal, err := pty.Start(shell)
-	if err != nil {
-		return err
-	}
-	defer terminal.Close()
-
-	local, err := newLocalTerminal()
-	if err != nil {
-		return err
-	}
-	local.Enter()
-	defer local.Close()
-
-	client, err := transport.Dial(ctx, connectInfo.HostWebSocketURL)
-	if err != nil {
-		return err
-	}
-	defer client.Close()
-	local.SetNote("shared session ready", 2*time.Second)
-	local.RenderStatusBar()
-
-	errCh := make(chan error, 3)
-	done := make(chan struct{})
-	statusCh := make(chan protocol.SessionStatusPayload, 1)
-	statusStore := &sessionStatusStore{}
-	var once sync.Once
-
-	stop := func(err error) {
-		once.Do(func() {
-			errCh <- err
-			close(done)
-		})
-	}
-
-	go func() {
-		if err := streamPTYToSocket(terminal, client, local, done); err != nil {
-			stop(err)
-		}
-	}()
-
-	go func() {
-		if err := streamSocketToPTY(terminal, client, statusCh, done); err != nil {
-			stop(err)
-		}
-	}()
-
-	go func() {
-		if err := runLocalInput(terminal, client, statusCh, statusStore, local, done); err != nil {
-			stop(err)
-		}
-	}()
-
-	go startStatusTicker(local, done)
-	go watchResize(terminal, local, done)
-
-	go func() {
-		if err := terminal.Wait(); err != nil {
-			stop(err)
-			return
-		}
-		stop(io.EOF)
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil
-	case err := <-errCh:
-		if errors.Is(err, io.EOF) || errors.Is(err, errStopSharing) {
-			return nil
-		}
-		return err
-	}
-}
-
 type connectInfo struct {
 	SessionID        string
 	ViewerURL        string
@@ -129,6 +39,124 @@ type createSessionResponse struct {
 	ViewerURL          string `json:"viewerUrl"`
 	HostWebSocketURL   string `json:"hostWebSocketUrl"`
 	ViewerWebSocketURL string `json:"viewerWebSocketUrl"`
+}
+
+func Run(ctx context.Context, cfg Config) error {
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+
+	shellPath := cfg.Shell
+	if shellPath == "" {
+		shellPath = platform.DefaultShell()
+	}
+
+	connectInfo, err := resolveConnection(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	terminal, err := pty.Start(prepareShellLaunch(shellPath))
+	if err != nil {
+		return err
+	}
+	defer terminal.Close()
+
+	fmt.Fprintf(os.Stdout, "Share URL: %s\n", connectInfo.ViewerURL)
+	fmt.Fprintln(os.Stdout, "Exit this shared shell with Ctrl-D or 'exit'.")
+
+	rawTerminal, err := enterRawTerminal()
+	if err != nil {
+		return err
+	}
+	defer rawTerminal.Close()
+
+	client, err := transport.Dial(ctx, connectInfo.HostWebSocketURL)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+
+	modal := newApprovalModal(os.Stdout)
+	if width, height, sizeErr := getTerminalSize(); sizeErr == nil {
+		modal.SetSize(width, height)
+		_ = terminal.Resize(uint16(width), uint16(height))
+	}
+
+	errCh := make(chan error, 4)
+	done := make(chan struct{})
+	statusCh := make(chan protocol.SessionStatusPayload, 4)
+	decisionCh := make(chan modalDecision, 2)
+	var once sync.Once
+
+	stop := func(runErr error) {
+		once.Do(func() {
+			errCh <- runErr
+			close(done)
+		})
+	}
+
+	forwardOutput := func(data []byte) error {
+		if len(data) == 0 {
+			return nil
+		}
+		if _, writeErr := os.Stdout.Write(data); writeErr != nil {
+			return writeErr
+		}
+		return client.WriteText(data)
+	}
+
+	go func() {
+		if runErr := streamPTYOutput(terminal, modal, forwardOutput, done); runErr != nil {
+			stop(runErr)
+		}
+	}()
+
+	go func() {
+		if runErr := streamSocketFrames(terminal, client, statusCh, done); runErr != nil {
+			stop(runErr)
+		}
+	}()
+
+	go func() {
+		if runErr := streamLocalInput(terminal, modal, forwardOutput, decisionCh, done); runErr != nil {
+			stop(runErr)
+		}
+	}()
+
+	go func() {
+		if runErr := handleSessionStatus(modal, statusCh, forwardOutput, done); runErr != nil {
+			stop(runErr)
+		}
+	}()
+
+	go func() {
+		if runErr := forwardModalDecisions(client, decisionCh, done); runErr != nil {
+			stop(runErr)
+		}
+	}()
+
+	go watchResize(terminal, modal, done)
+
+	go func() {
+		if waitErr := terminal.Wait(); waitErr != nil {
+			stop(waitErr)
+			return
+		}
+		stop(io.EOF)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case runErr := <-errCh:
+		if errors.Is(runErr, io.EOF) {
+			return nil
+		}
+		return runErr
+	}
 }
 
 func resolveConnection(ctx context.Context, cfg Config) (connectInfo, error) {
@@ -242,10 +270,10 @@ func sessionIDFromPath(p string) string {
 	return ""
 }
 
-func streamPTYToSocket(
+func streamPTYOutput(
 	terminal *pty.Session,
-	client *transport.Client,
-	local *localTerminal,
+	modal *approvalModal,
+	forward func([]byte) error,
 	done <-chan struct{},
 ) error {
 	buf := make([]byte, 4096)
@@ -259,10 +287,8 @@ func streamPTYToSocket(
 
 		n, err := terminal.Read(buf)
 		if n > 0 {
-			if writeErr := local.WritePTYOutput(buf[:n]); writeErr != nil {
-				return writeErr
-			}
-			if writeErr := client.WriteText(buf[:n]); writeErr != nil {
+			chunk := append([]byte(nil), buf[:n]...)
+			if writeErr := modal.HandlePTYOutput(chunk, forward); writeErr != nil {
 				return writeErr
 			}
 		}
@@ -276,7 +302,7 @@ func streamPTYToSocket(
 	}
 }
 
-func streamSocketToPTY(
+func streamSocketFrames(
 	terminal *pty.Session,
 	client *transport.Client,
 	statusCh chan<- protocol.SessionStatusPayload,
@@ -318,12 +344,6 @@ func handleControlFrame(
 		}
 		_, err := terminal.Write([]byte(stdin.Data))
 		return err
-	case protocol.TypeResize:
-		var resize protocol.ResizePayload
-		if err := json.Unmarshal(envelope.Payload, &resize); err != nil {
-			return err
-		}
-		return terminal.Resize(resize.Cols, resize.Rows)
 	case protocol.TypeSessionStatus:
 		var status protocol.SessionStatusPayload
 		if err := json.Unmarshal(envelope.Payload, &status); err != nil {
@@ -339,60 +359,43 @@ func handleControlFrame(
 	}
 }
 
-func runLocalInput(
+func streamLocalInput(
 	terminal *pty.Session,
-	client *transport.Client,
-	statusCh <-chan protocol.SessionStatusPayload,
-	statusStore *sessionStatusStore,
-	local *localTerminal,
+	modal *approvalModal,
+	forward func([]byte) error,
+	decisionCh chan<- modalDecision,
 	done <-chan struct{},
 ) error {
-	inputCh := make(chan byte, 16)
-	errCh := make(chan error, 1)
-
-	go readLocalBytes(inputCh, errCh, done)
-
-	prefixMode := false
-
+	buf := make([]byte, 4096)
 	for {
 		select {
 		case <-done:
 			return nil
-		case status := <-statusCh:
-			statusStore.Set(status)
-			local.UpdateStatus(status)
-			if status.PendingControlRequest != nil {
-				local.SetNote(
-					fmt.Sprintf(
-						"request from %s | Ctrl-G then a/d",
-						status.PendingControlRequest.ViewerID,
-					),
-					4*time.Second,
-				)
+		default:
+		}
+
+		n, err := os.Stdin.Read(buf)
+		if n > 0 {
+			chunk := append([]byte(nil), buf[:n]...)
+			handled, decision, handleErr := modal.HandleLocalInput(chunk, forward)
+			if handleErr != nil {
+				return handleErr
 			}
-			local.RenderStatusBar()
-		case b := <-inputCh:
-			if prefixMode {
-				if err := handleLocalAction(b, client, statusStore, local); err != nil {
-					return err
+			if decision != nil {
+				select {
+				case decisionCh <- *decision:
+				case <-done:
+					return nil
 				}
-				prefixMode = false
-				local.SetPrefixMode(false)
-				local.RenderStatusBar()
-				continue
 			}
+			if !handled {
+				if _, writeErr := terminal.Write(chunk); writeErr != nil {
+					return writeErr
+				}
+			}
+		}
 
-			if b == localPrefixKey {
-				prefixMode = true
-				local.SetPrefixMode(true)
-				local.RenderStatusBar()
-				continue
-			}
-
-			if _, err := terminal.Write([]byte{b}); err != nil {
-				return err
-			}
-		case err := <-errCh:
+		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
@@ -401,46 +404,71 @@ func runLocalInput(
 	}
 }
 
-func readLocalBytes(inputCh chan<- byte, errCh chan<- error, done <-chan struct{}) {
-	buf := make([]byte, 1)
+func handleSessionStatus(
+	modal *approvalModal,
+	statusCh <-chan protocol.SessionStatusPayload,
+	forward func([]byte) error,
+	done <-chan struct{},
+) error {
 	for {
 		select {
 		case <-done:
-			return
-		default:
-		}
-
-		n, err := os.Stdin.Read(buf)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		if n == 1 {
-			inputCh <- buf[0]
+			return nil
+		case status := <-statusCh:
+			if err := modal.SyncPendingRequest(status.PendingControlRequest, forward); err != nil {
+				return err
+			}
 		}
 	}
 }
 
-type sessionStatusStore struct {
-	mu     sync.RWMutex
-	status protocol.SessionStatusPayload
-}
-
-func (s *sessionStatusStore) Get() protocol.SessionStatusPayload {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.status
-}
-
-func (s *sessionStatusStore) Set(status protocol.SessionStatusPayload) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.status = status
-}
-
-func emptyFallback(value string, fallback string) string {
-	if value == "" {
-		return fallback
+func forwardModalDecisions(
+	client *transport.Client,
+	decisionCh <-chan modalDecision,
+	done <-chan struct{},
+) error {
+	for {
+		select {
+		case <-done:
+			return nil
+		case decision := <-decisionCh:
+			switch decision.Action {
+			case modalApprove:
+				if err := client.WriteJSON(map[string]any{
+					"type": protocol.TypeControlApprove,
+					"payload": protocol.ControlApprovePayload{
+						ViewerID:     decision.ViewerID,
+						LeaseSeconds: decision.LeaseSeconds,
+					},
+				}); err != nil {
+					return err
+				}
+			case modalReject:
+				if err := client.WriteJSON(map[string]any{
+					"type": protocol.TypeControlReject,
+					"payload": protocol.ControlRejectPayload{
+						ViewerID: decision.ViewerID,
+					},
+				}); err != nil {
+					return err
+				}
+			}
+		}
 	}
-	return value
+}
+
+type rawTerminal struct {
+	state *term.State
+}
+
+func enterRawTerminal() (*rawTerminal, error) {
+	state, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		return nil, err
+	}
+	return &rawTerminal{state: state}, nil
+}
+
+func (r *rawTerminal) Close() error {
+	return term.Restore(int(os.Stdin.Fd()), r.state)
 }

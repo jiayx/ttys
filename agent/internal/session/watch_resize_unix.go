@@ -10,7 +10,7 @@ import (
 	"github.com/jiayx/ttys/agent/internal/pty"
 )
 
-func watchResize(terminal *pty.Session, local *localTerminal, done <-chan struct{}) {
+func watchResize(terminal *pty.Session, modal *approvalModal, done <-chan struct{}) {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGWINCH)
 	defer signal.Stop(signals)
@@ -20,10 +20,8 @@ func watchResize(terminal *pty.Session, local *localTerminal, done <-chan struct
 		if err != nil {
 			return
 		}
-		local.SetSize(width, height)
-		rows := local.ContentRows()
-		_ = terminal.Resize(uint16(width), rows)
-		local.RenderStatusBar()
+		modal.SetSize(width, height)
+		_ = terminal.Resize(uint16(width), uint16(height))
 	}
 
 	apply()

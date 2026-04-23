@@ -14,9 +14,19 @@ type Session struct {
 	file *os.File
 }
 
-func Start(shell string) (*Session, error) {
-	cmd := exec.Command(shell)
-	cmd.Env = os.Environ()
+type LaunchConfig struct {
+	Path string
+	Args []string
+	Env  []string
+}
+
+func Start(cfg LaunchConfig) (*Session, error) {
+	cmd := exec.Command(cfg.Path, cfg.Args...)
+	if len(cfg.Env) > 0 {
+		cmd.Env = cfg.Env
+	} else {
+		cmd.Env = os.Environ()
+	}
 	file, err := pty.Start(cmd)
 	if err != nil {
 		return nil, err
