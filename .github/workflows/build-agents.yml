@@ -7,11 +7,40 @@ on:
       - "v*"
     branches:
       - main
+    paths:
+      - "agent/**"
+      - "agent-zig/**"
+      - ".github/workflows/build-agents.yml"
   workflow_dispatch:
 
 jobs:
+  detect-changes:
+    name: Detect Agent Changes
+    runs-on: ubuntu-24.04
+    outputs:
+      agent: ${{ steps.filter.outputs.agent }}
+      agent_zig: ${{ steps.filter.outputs.agent_zig }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            agent:
+              - 'agent/**'
+            agent_zig:
+              - 'agent-zig/**'
+
   build-go:
     name: Go ${{ matrix.goos }}-${{ matrix.goarch }}
+    needs: detect-changes
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      needs.detect-changes.outputs.agent == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -64,6 +93,11 @@ jobs:
 
   build-zig:
     name: Zig ${{ matrix.id }}
+    needs: detect-changes
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      needs.detect-changes.outputs.agent_zig == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -154,6 +188,12 @@ jobs:
     needs:
       - build-go
       - build-zig
+    if: |
+      always() &&
+      (
+        needs.build-go.result == 'success' ||
+        needs.build-zig.result == 'success'
+      )
     permissions:
       contents: write
 

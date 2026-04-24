@@ -14,7 +14,6 @@ type Env = {
 type ReleaseManifest = {
   binaryBaseURL: string;
   checksumsURL: string;
-  version: string;
   targets: Record<string, string>;
 };
 
@@ -25,8 +24,6 @@ const releaseTargets = {
   "linux-arm64": "ttys-agent-linux-arm64",
   "windows-amd64": "ttys-agent-windows-amd64.exe",
 } as const;
-
-const latestReleaseCacheTtlSeconds = 300;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -71,19 +68,14 @@ export default {
     }
 
     if (url.pathname === "/api/bootstrap/manifest" && request.method === "GET") {
-      return Response.json(await bootstrapManifest(url, env), {
-        headers: {
-          "cache-control": `public, max-age=${latestReleaseCacheTtlSeconds}`,
-        },
-      });
+      return Response.json(bootstrapManifest(url, env));
     }
 
     if (url.pathname.startsWith("/downloads/release/") && request.method === "GET") {
       const assetName = url.pathname.slice("/downloads/release/".length);
       if (!assetName) return new Response("missing asset name", { status: 400 });
 
-      const release = await latestGitHubRelease(env);
-      const downloadURL = releaseAssetURL(env, release.tag_name, assetName);
+      const downloadURL = latestReleaseAssetURL(env, assetName);
       return Response.redirect(downloadURL, 302);
     }
 
@@ -151,20 +143,13 @@ function bootstrapChecksumsURL(url: URL, env: Env) {
   return `${bootstrapBinaryBaseURL(url, env)}/checksums.txt`;
 }
 
-async function bootstrapManifest(url: URL, env: Env): Promise<ReleaseManifest> {
+function bootstrapManifest(url: URL, env: Env): ReleaseManifest {
   const binaryBaseURL = bootstrapBinaryBaseURL(url, env);
   const checksumsURL = bootstrapChecksumsURL(url, env);
-
-  let version = "local";
-  if (env.BOOTSTRAP_GITHUB_REPOSITORY) {
-    const release = await latestGitHubRelease(env);
-    version = release.tag_name;
-  }
 
   return {
     binaryBaseURL,
     checksumsURL,
-    version,
     targets: Object.fromEntries(
       Object.entries(releaseTargets).map(([target, assetName]) => [
         target,
@@ -174,43 +159,8 @@ async function bootstrapManifest(url: URL, env: Env): Promise<ReleaseManifest> {
   };
 }
 
-type GitHubRelease = {
-  tag_name: string;
-};
-
-async function latestGitHubRelease(env: Env): Promise<GitHubRelease> {
+function latestReleaseAssetURL(env: Env, assetName: string): string {
   const repository = env.BOOTSTRAP_GITHUB_REPOSITORY;
   if (!repository) throw new Error("BOOTSTRAP_GITHUB_REPOSITORY is not configured");
-
-  const cache = caches.default;
-  const cacheURL = new URL(`https://bootstrap-cache.internal/github/latest/${repository}`);
-  const cacheKey = new Request(cacheURL.toString(), { method: "GET" });
-  const cached = await cache.match(cacheKey);
-  if (cached) return (await cached.json()) as GitHubRelease;
-
-  const response = await fetch(`https://api.github.com/repos/${repository}/releases/latest`, {
-    headers: {
-      accept: "application/vnd.github+json",
-      "user-agent": "ttys-bootstrap-worker",
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`GitHub latest release lookup failed: ${response.status}`);
-  }
-
-  const release = (await response.json()) as GitHubRelease;
-  const cacheResponse = new Response(JSON.stringify(release), {
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": `public, max-age=${latestReleaseCacheTtlSeconds}`,
-    },
-  });
-  await cache.put(cacheKey, cacheResponse.clone());
-  return release;
-}
-
-function releaseAssetURL(env: Env, tag: string, assetName: string): string {
-  const repository = env.BOOTSTRAP_GITHUB_REPOSITORY;
-  if (!repository) throw new Error("BOOTSTRAP_GITHUB_REPOSITORY is not configured");
-  return `https://github.com/${repository}/releases/download/${tag}/${assetName}`;
+  return `https://github.com/${repository}/releases/latest/download/${assetName}`;
 }
