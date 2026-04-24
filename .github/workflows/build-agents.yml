@@ -81,30 +81,18 @@ jobs:
             linux_transport: ""
             ext: ""
             asset: ttys-agent-zig-darwin-arm64
-          - id: linux-amd64-system
-            runner: ubuntu-24.04
-            target: ""
-            linux_transport: system
-            ext: ""
-            asset: ttys-agent-zig-linux-amd64-system
-          - id: linux-amd64-portable
+          - id: linux-amd64
             runner: ubuntu-24.04
             target: x86_64-linux-gnu
             linux_transport: portable
             ext: ""
-            asset: ttys-agent-zig-linux-amd64-portable
-          - id: linux-arm64-system
-            runner: ubuntu-24.04-arm
-            target: ""
-            linux_transport: system
-            ext: ""
-            asset: ttys-agent-zig-linux-arm64-system
-          - id: linux-arm64-portable
+            asset: ttys-agent-zig-linux-amd64
+          - id: linux-arm64
             runner: ubuntu-24.04
             target: aarch64-linux-gnu
             linux_transport: portable
             ext: ""
-            asset: ttys-agent-zig-linux-arm64-portable
+            asset: ttys-agent-zig-linux-arm64
           - id: windows-amd64
             runner: windows-2025
             target: x86_64-windows-gnu
@@ -125,14 +113,6 @@ jobs:
           key: zig-${{ matrix.id }}-0.16.0-${{ hashFiles('agent-zig/build.zig', 'agent-zig/build.zig.zon', 'agent-zig/src/**') }}
           restore-keys: |
             zig-${{ matrix.id }}-0.16.0-
-
-      - name: Install Linux system dependencies
-        if: runner.os == 'Linux' && matrix.linux_transport == 'system'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y libcurl4-openssl-dev
 
       - name: Build Zig agent
         shell: bash

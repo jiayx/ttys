@@ -13,7 +13,7 @@ Anonymous shared terminal over Cloudflare Workers and Durable Objects.
 
 - The web app can create a session, attach viewers, and bridge host/viewer websocket traffic through the Worker.
 - The Go agent is the main implementation.
-- The Zig agent is being brought up against the Go behavior. It currently builds on macOS, Windows, and Linux portable/system targets, but it should still be treated as under validation rather than fully parity-complete.
+- The Zig agent is being brought up against the Go behavior. It currently builds on macOS, Windows, and Linux, but it should still be treated as under validation rather than fully parity-complete.
 
 ## Repository Layout
 
@@ -112,26 +112,17 @@ cd agent-zig
 zig build -Dtarget=x86_64-windows-gnu
 ```
 
-Build Linux portable:
+Build Linux:
 
 ```bash
 cd agent-zig
-zig build -Dtarget=x86_64-linux-gnu -Dlinux_transport=portable
-```
-
-Build Linux system transport:
-
-```bash
-cd agent-zig
-zig build -Dtarget=x86_64-linux-gnu -Dlinux_transport=system
+zig build -Dtarget=x86_64-linux-gnu
 ```
 
 Notes:
 
 - macOS uses system `libcurl` for websocket transport.
-- Linux has two Zig transport variants:
-  - `system`: depends on system `libcurl`
-  - `portable`: avoids `libcurl` for websocket transport
+- Linux defaults to the portable Zig transport and no longer ships separate `system` and `portable` release variants.
 - Windows uses `WinHTTP` plus `ConPTY`; this path builds successfully but still needs more runtime validation.
 
 ## Local Bootstrap Assets
@@ -164,10 +155,8 @@ It builds:
 - Zig:
   - `ttys-agent-zig-darwin-amd64`
   - `ttys-agent-zig-darwin-arm64`
-  - `ttys-agent-zig-linux-amd64-system`
-  - `ttys-agent-zig-linux-amd64-portable`
-  - `ttys-agent-zig-linux-arm64-system`
-  - `ttys-agent-zig-linux-arm64-portable`
+  - `ttys-agent-zig-linux-amd64`
+  - `ttys-agent-zig-linux-arm64`
   - `ttys-agent-zig-windows-amd64.exe`
 
 On `v*` tags, the workflow also publishes all assets plus `checksums.txt` to GitHub Releases.
@@ -176,4 +165,4 @@ On `v*` tags, the workflow also publishes all assets plus `checksums.txt` to Git
 
 If you want the most conservative path today, use the Go agent.
 
-If you want the smallest Zig binary with fewer external dependencies on Linux, prefer the Zig `portable` variant.
+On Linux, the Zig release binary uses the portable transport by default.

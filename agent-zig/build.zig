@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
         system,
         portable,
     };
-    const linux_transport = b.option(LinuxTransport, "linux_transport", "Linux transport implementation: system or portable") orelse .system;
+    const linux_transport = b.option(LinuxTransport, "linux_transport", "Linux transport implementation: system or portable") orelse .portable;
     const options = b.addOptions();
     options.addOption(LinuxTransport, "linux_transport", linux_transport);
 
