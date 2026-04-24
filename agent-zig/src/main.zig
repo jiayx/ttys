@@ -7,6 +7,7 @@ const transport_mod = @import("transport.zig");
 
 const posix_c = if (builtin.os.tag == .windows) struct {} else @cImport({
     @cInclude("errno.h");
+    @cInclude("poll.h");
     @cInclude("unistd.h");
 });
 
@@ -389,7 +390,6 @@ pub fn main(init: std.process.Init) !void {
     const shell = config.shell orelse platform.defaultShell();
 
     var pty = try PTY.spawn(shell);
-    defer pty.close();
 
     std.debug.print("Share URL: {s}\n", .{connect_info.viewer_url});
     std.debug.print("Exit this shared shell with Ctrl-D or 'exit'.\n", .{});
@@ -398,7 +398,6 @@ pub fn main(init: std.process.Init) !void {
     defer raw_terminal.leave();
 
     var ws = try WebSocketClient.connect(allocator, init.io, connect_info.host_websocket_url);
-    defer ws.close();
 
     var output = SharedOutput{ .websocket = &ws };
     var modal = ApprovalModal.init(allocator);
@@ -419,21 +418,17 @@ pub fn main(init: std.process.Init) !void {
         .ws = &ws,
     };
 
-    const pty_thread = try std.Thread.spawn(.{}, ptyReaderMain, .{&context});
-    const ws_thread = try std.Thread.spawn(.{}, websocketReaderMain, .{&context});
-    const stdin_thread = try std.Thread.spawn(.{}, stdinMain, .{&context});
-    const resize_thread = try std.Thread.spawn(.{}, resizeMain, .{&context});
-    const wait_thread = try std.Thread.spawn(.{}, childWaitMain, .{&context});
+    _ = try std.Thread.spawn(.{}, ptyReaderMain, .{&context});
+    _ = try std.Thread.spawn(.{}, websocketReaderMain, .{&context});
+    _ = try std.Thread.spawn(.{}, stdinMain, .{&context});
+    _ = try std.Thread.spawn(.{}, resizeMain, .{&context});
+    _ = try std.Thread.spawn(.{}, childWaitMain, .{&context});
 
     const err = state.wait();
 
-    pty_thread.join();
-    ws_thread.join();
-    stdin_thread.join();
-    resize_thread.join();
-    wait_thread.join();
-
-    if (err != null) {
+    if (err) |message| {
+        try writeStderrAll(message);
+        try writeStderrAll("\n");
         return error.RunFailed;
     }
 }
@@ -490,8 +485,10 @@ fn stdinMain(ctx: *ThreadContext) void {
     while (!ctx.state.isDone()) {
         const n = readStdin(&buf);
         if (n == 0) {
-            ctx.state.finishOk();
             return;
+        }
+        if (n == -2) {
+            continue;
         }
         if (n < 0) {
             if (isInterrupted()) continue;
@@ -546,7 +543,7 @@ fn childWaitMain(ctx: *ThreadContext) void {
 }
 
 fn handleControlFrame(ctx: *ThreadContext, payload: []const u8) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, ctx.allocator, payload, .{});
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, payload, .{}) catch return;
     defer parsed.deinit();
 
     const root = parsed.value.object;
@@ -592,14 +589,27 @@ fn parseArgs(allocator: Allocator, process_args: std.process.Args) !Config {
     var args = try std.process.Args.Iterator.initAllocator(process_args, allocator);
     defer args.deinit();
 
-    _ = args.next();
+    var argv = std.array_list.Managed([]const u8).init(allocator);
+    defer argv.deinit();
+
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-server")) {
-            config.server_url = args.next() orelse return error.MissingServerValue;
-        } else if (std.mem.eql(u8, arg, "-session")) {
-            config.session_id = args.next() orelse return error.MissingSessionValue;
-        } else if (std.mem.eql(u8, arg, "-shell")) {
-            config.shell = args.next() orelse return error.MissingShellValue;
+        try argv.append(arg);
+    }
+
+    var index: usize = 1;
+    while (index < argv.items.len) : (index += 1) {
+        const arg = argv.items[index];
+        const next_arg = if (index + 1 < argv.items.len) argv.items[index + 1] else null;
+
+        if (try parseFlagValue(arg, next_arg, "--server", "-server")) |value| {
+            config.server_url = value.value;
+            if (value.consumed_next) index += 1;
+        } else if (try parseFlagValue(arg, next_arg, "--session", "-session")) |value| {
+            config.session_id = value.value;
+            if (value.consumed_next) index += 1;
+        } else if (try parseFlagValue(arg, next_arg, "--shell", "-shell")) |value| {
+            config.shell = value.value;
+            if (value.consumed_next) index += 1;
         } else {
             return error.UnknownArgument;
         }
@@ -667,10 +677,52 @@ fn httpPostAlloc(allocator: Allocator, io: std.Io, url: []const u8) ![]u8 {
     try request.sendBodiless();
 
     var response = try request.receiveHead(&.{});
-    if (response.head.status != .ok) return error.CreateSessionFailed;
-
     var reader = response.reader(&.{});
+    if (response.head.status != .ok) {
+        const body = try reader.allocRemaining(allocator, .limited(4 << 10));
+        defer allocator.free(body);
+        const trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (trimmed.len > 0) {
+            try writeStderrAll("create session failed: ");
+            try writeStderrAll(trimmed);
+            try writeStderrAll("\n");
+        } else {
+            try writeStderrAll("create session failed\n");
+        }
+        return error.CreateSessionFailed;
+    }
+
     return try reader.allocRemaining(allocator, .limited(4 << 10));
+}
+
+const ParsedFlagValue = struct {
+    value: []const u8,
+    consumed_next: bool,
+};
+
+fn parseFlagValue(arg: []const u8, next_arg: ?[]const u8, long_name: []const u8, short_name: []const u8) !?ParsedFlagValue {
+    if (std.mem.eql(u8, arg, long_name) or std.mem.eql(u8, arg, short_name)) {
+        return .{
+            .value = next_arg orelse return error.MissingFlagValue,
+            .consumed_next = true,
+        };
+    }
+
+    if (std.mem.startsWith(u8, arg, long_name) and arg.len > long_name.len and arg[long_name.len] == '=') {
+        return .{
+            .value = arg[long_name.len + 1 ..],
+            .consumed_next = false,
+        };
+    }
+
+    if (std.mem.startsWith(u8, arg, short_name) and arg.len > short_name.len and arg[short_name.len] == '=') {
+        return .{
+            .value = arg[short_name.len + 1 ..],
+            .consumed_next = false,
+        };
+    }
+
+    return null;
 }
 
 fn resolveRelativeURL(allocator: Allocator, base_url: []const u8, value: []const u8) ![]u8 {
@@ -711,12 +763,15 @@ fn viewerURLFromWebSocket(allocator: Allocator, websocket_url: []const u8) ![]u8
         parsed.scheme = "http";
     }
 
-    const path = parsed.path.raw;
+    var path_buffer: [1024]u8 = undefined;
+    const path = try parsed.path.toRaw(&path_buffer);
     var parts = std.mem.splitScalar(u8, std.mem.trim(u8, path, "/"), '/');
     _ = parts.next();
     _ = parts.next();
     if (parts.next()) |session_id| {
-        parsed.path = .{ .raw = try std.fmt.allocPrint(allocator, "/s/{s}", .{session_id}) };
+        var viewer_path_buffer: [256]u8 = undefined;
+        const viewer_path = try std.fmt.bufPrint(&viewer_path_buffer, "/s/{s}", .{session_id});
+        parsed.path = .{ .raw = viewer_path };
         parsed.query = null;
         parsed.fragment = null;
     }
@@ -822,6 +877,36 @@ fn writeStdoutAll(bytes: []const u8) !void {
     }
 }
 
+fn writeStderrAll(bytes: []const u8) !void {
+    if (builtin.os.tag == .windows) {
+        const handle = win_c.GetStdHandle(win_c.STD_ERROR_HANDLE);
+        if (handle == null or handle == win_c.INVALID_HANDLE_VALUE) return error.StderrWriteFailed;
+
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            var written: win_c.DWORD = 0;
+            const chunk_len: usize = @min(bytes.len - offset, std.math.maxInt(win_c.DWORD));
+            if (win_c.WriteFile(handle, bytes.ptr + offset, @intCast(chunk_len), &written, null) == 0) {
+                return error.StderrWriteFailed;
+            }
+            if (written == 0) return error.StderrWriteFailed;
+            offset += written;
+        }
+        return;
+    }
+
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const written = posix_c.write(2, bytes.ptr + offset, bytes.len - offset);
+        if (written < 0) {
+            if (isInterrupted()) continue;
+            return error.StderrWriteFailed;
+        }
+        if (written == 0) return error.StderrWriteFailed;
+        offset += @intCast(written);
+    }
+}
+
 fn readStdin(buf: []u8) isize {
     if (builtin.os.tag == .windows) {
         const handle = win_c.GetStdHandle(win_c.STD_INPUT_HANDLE);
@@ -831,6 +916,15 @@ fn readStdin(buf: []u8) isize {
         if (win_c.ReadFile(handle, buf.ptr, @intCast(buf.len), &read_count, null) == 0) return -1;
         return @intCast(read_count);
     }
+
+    var poll_fd = posix_c.pollfd{
+        .fd = 0,
+        .events = posix_c.POLLIN,
+        .revents = 0,
+    };
+    const poll_result = posix_c.poll(&poll_fd, 1, 100);
+    if (poll_result == 0) return -2;
+    if (poll_result < 0) return -1;
 
     return posix_c.read(0, buf.ptr, buf.len);
 }
@@ -868,5 +962,51 @@ fn jsonEscapeAlloc(allocator: Allocator, value: []const u8) ![]u8 {
 }
 
 fn uriToStringAlloc(allocator: Allocator, uri: std.Uri) ![]u8 {
-    return try std.fmt.allocPrint(allocator, "{}", .{uri});
+    return try std.fmt.allocPrint(allocator, "{f}", .{uri});
+}
+
+test "parseFlagValue handles split and inline forms" {
+    const split = (try parseFlagValue("--server", "http://localhost:5173", "--server", "-server")).?;
+    try std.testing.expectEqualStrings("http://localhost:5173", split.value);
+    try std.testing.expect(split.consumed_next);
+
+    const inline_long = (try parseFlagValue("--server=http://localhost:5173", null, "--server", "-server")).?;
+    try std.testing.expectEqualStrings("http://localhost:5173", inline_long.value);
+    try std.testing.expect(!inline_long.consumed_next);
+
+    const inline_short = (try parseFlagValue("-server=http://localhost:5173", null, "--server", "-server")).?;
+    try std.testing.expectEqualStrings("http://localhost:5173", inline_short.value);
+    try std.testing.expect(!inline_short.consumed_next);
+
+    try std.testing.expectError(error.MissingFlagValue, parseFlagValue("--server", null, "--server", "-server"));
+    try std.testing.expectEqual(@as(?ParsedFlagValue, null), try parseFlagValue("--other", null, "--server", "-server"));
+}
+
+test "url helpers render HTTP and websocket routes correctly" {
+    const allocator = std.testing.allocator;
+
+    const viewer_url = try resolveRelativeURL(allocator, "http://localhost:5173", "/s/abc");
+    defer allocator.free(viewer_url);
+    try std.testing.expectEqualStrings("http://localhost:5173/s/abc", viewer_url);
+
+    const ws_url = try websocketURL(allocator, "https://example.com", "/api/session/abc/host");
+    defer allocator.free(ws_url);
+    try std.testing.expectEqualStrings("wss://example.com/api/session/abc/host", ws_url);
+
+    const viewer_from_ws = try viewerURLFromWebSocket(allocator, "ws://localhost:5173/api/session/abc/host");
+    defer allocator.free(viewer_from_ws);
+    try std.testing.expectEqualStrings("http://localhost:5173/s/abc", viewer_from_ws);
+}
+
+test "uriToStringAlloc formats URI text rather than debug output" {
+    const allocator = std.testing.allocator;
+
+    var uri = try std.Uri.parse("http://127.0.0.1:5173");
+    uri.path = .{ .raw = "/api/session" };
+    uri.query = null;
+    uri.fragment = null;
+
+    const rendered = try uriToStringAlloc(allocator, uri);
+    defer allocator.free(rendered);
+    try std.testing.expectEqualStrings("http://127.0.0.1:5173/api/session", rendered);
 }

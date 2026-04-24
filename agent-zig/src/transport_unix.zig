@@ -108,7 +108,6 @@ pub const WebSocketClient = struct {
             const meta = meta_ptr.?;
 
             if ((meta.flags & c.CURLWS_PING) != 0) {
-                try self.sendPong(buf[0..received]);
                 continue;
             }
             if ((meta.flags & c.CURLWS_CLOSE) != 0) return error.ConnectionClosed;
@@ -123,31 +122,23 @@ pub const WebSocketClient = struct {
 
         return try result.toOwnedSlice();
     }
-
-    fn sendPong(self: *WebSocketClient, payload: []const u8) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
-
-        var offset: usize = 0;
-        while (offset < payload.len or (payload.len == 0 and offset == 0)) {
-            var sent: usize = 0;
-            var dummy: [1]u8 = .{0};
-            const ptr = if (payload.len == 0) dummy[0..].ptr else payload.ptr + offset;
-            const remaining = if (payload.len == 0) 0 else payload.len - offset;
-            const code = c.curl_ws_send(self.easy, ptr, remaining, &sent, 0, c.CURLWS_PONG);
-            if (code == c.CURLE_AGAIN) {
-                sleepMillis(10);
-                continue;
-            }
-            try curlCode(code);
-            if (payload.len == 0) break;
-            offset += sent;
-        }
-    }
 };
 
 fn curlCode(code: c.CURLcode) !void {
-    if (code != c.CURLE_OK) return error.CurlFailed;
+    if (code == c.CURLE_OK) return;
+
+    return switch (code) {
+        c.CURLE_UNSUPPORTED_PROTOCOL => error.CurlUnsupportedProtocol,
+        c.CURLE_URL_MALFORMAT => error.CurlUrlMalformed,
+        c.CURLE_NOT_BUILT_IN => error.CurlNotBuiltIn,
+        c.CURLE_COULDNT_RESOLVE_HOST => error.CurlCouldntResolveHost,
+        c.CURLE_COULDNT_CONNECT => error.CurlCouldntConnect,
+        c.CURLE_WEIRD_SERVER_REPLY => error.CurlWeirdServerReply,
+        c.CURLE_SEND_ERROR => error.CurlSendError,
+        c.CURLE_RECV_ERROR => error.CurlRecvError,
+        c.CURLE_GOT_NOTHING => error.ConnectionClosed,
+        else => error.CurlFailed,
+    };
 }
 
 fn sleepMillis(ms: u64) void {

@@ -4,11 +4,8 @@ dist
 .wrangler
 coverage
 *.log
-agent/bin
 
 .cache/
-agent/.cache/
 apps/web/public/downloads/local/
 .zig-cache/
-.zig-cache-global/
 zig-out/

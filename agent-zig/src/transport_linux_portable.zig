@@ -30,7 +30,7 @@ pub fn globalDeinit() void {}
 
 pub const WebSocketClient = struct {
     io: Io,
-    client: std.http.Client,
+    client: *std.http.Client,
     connection: *std.http.Client.Connection,
     write_lock: Mutex = .{},
 
@@ -62,7 +62,10 @@ pub const WebSocketClient = struct {
     };
 
     pub fn connect(allocator: Allocator, io: Io, url: []const u8) !WebSocketClient {
-        var client: std.http.Client = .{
+        const client = try allocator.create(std.http.Client);
+        errdefer allocator.destroy(client);
+
+        client.* = .{
             .allocator = allocator,
             .io = io,
         };
@@ -81,7 +84,7 @@ pub const WebSocketClient = struct {
             .{ .name = "Sec-WebSocket-Key", .value = &key_b64 },
         };
 
-        var request = try std.http.Client.request(&client, .GET, uri, .{
+        var request = try std.http.Client.request(client, .GET, uri, .{
             .headers = .{
                 .connection = .{ .override = "Upgrade" },
                 .user_agent = .{ .override = "ttys-agent-zig" },
@@ -112,8 +115,9 @@ pub const WebSocketClient = struct {
 
     pub fn close(self: *WebSocketClient) void {
         self.connection.closing = true;
-        self.connection.end() catch {};
-        self.connection.stream_reader.stream.close(self.io);
+        self.client.connection_pool.release(self.connection, self.io);
+        self.client.deinit();
+        self.client.allocator.destroy(self.client);
     }
 
     pub fn writeText(self: *WebSocketClient, bytes: []const u8) !void {

@@ -7,6 +7,7 @@ const impl = switch (builtin.os.tag) {
         .system => @import("transport_unix.zig"),
         .portable => @import("transport_linux_portable.zig"),
     },
+    .macos => @import("transport_linux_portable.zig"),
     else => @import("transport_unix.zig"),
 };
 
