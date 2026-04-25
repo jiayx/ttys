@@ -1,4 +1,8 @@
-# ttys
+<p align="center">
+  <img src="apps/web/public/logo.svg" alt="ttys logo" width="96" height="96">
+</p>
+
+<h1 align="center">ttys</h1>
 
 Anonymous shared terminal over Cloudflare Workers and Durable Objects.
 
