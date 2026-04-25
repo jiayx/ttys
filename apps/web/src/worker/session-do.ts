@@ -1,10 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   BinaryMessageType,
-  arrayBufferToBase64,
   binarySocketDataToArrayBuffer,
   decodeBinaryMessage,
-  type BackfillChunk,
 } from "../protocol";
 
 type SessionState = "idle" | "ready" | "active" | "closed";
@@ -28,7 +26,7 @@ export class TTYSession extends DurableObject {
   private viewers = new Map<WebSocket, ViewerInfo>();
   private state: SessionState = "idle";
   private hostConnected = false;
-  private buffer: BackfillChunk[] = [];
+  private buffer: ArrayBuffer[] = [];
   private currentControllerId: string | null = null;
   private controlLeaseExpiresAt: number | null = null;
   private pendingRequest: ControlRequest | null = null;
@@ -103,14 +101,9 @@ export class TTYSession extends DurableObject {
       }),
     );
     if (role === "viewer" && this.buffer.length > 0) {
-      server.send(
-        JSON.stringify({
-          type: "session.backfill",
-          payload: {
-            chunks: this.buffer,
-          },
-        }),
-      );
+      for (const chunk of this.buffer) {
+        server.send(chunk);
+      }
     }
     this.broadcastStatus();
     void this.scheduleNextAlarm();
@@ -161,10 +154,7 @@ export class TTYSession extends DurableObject {
         return;
       }
 
-      this.pushBuffer({
-        messageType: binary.messageType,
-        data: arrayBufferToBase64(binary.payload),
-      });
+      this.pushBuffer(buffer);
 
       for (const viewer of this.viewers.values()) {
         viewer.socket.send(buffer);
@@ -299,8 +289,8 @@ export class TTYSession extends DurableObject {
     return viewer?.id === this.currentControllerId;
   }
 
-  private pushBuffer(chunk: BackfillChunk) {
-    this.buffer.push(chunk);
+  private pushBuffer(chunk: ArrayBuffer) {
+    this.buffer.push(chunk.slice(0));
     if (this.buffer.length > 64) {
       this.buffer.shift();
     }

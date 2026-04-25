@@ -2,10 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { mountTerminal, type TerminalController } from "./terminal";
 import {
   BinaryMessageType,
-  base64ToBytes,
   binarySocketDataToArrayBuffer,
   encodeBinaryMessage,
-  type BackfillChunk,
 } from "../protocol";
 
 type SessionInfo = {
@@ -351,15 +349,6 @@ export function App() {
         setSessionStatus(payload);
         setRequestingControl(Boolean(payload.pendingControlRequest));
         return;
-      }
-
-      if (frame.type === "session.backfill") {
-        const chunks = (frame.payload as { chunks?: BackfillChunk[] }).chunks ?? [];
-        for (const chunk of chunks) {
-          if (chunk.messageType === BinaryMessageType.ttyOutput) {
-            terminal.current?.write(base64ToBytes(chunk.data));
-          }
-        }
       }
     }
 
