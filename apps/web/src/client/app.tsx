@@ -78,19 +78,19 @@ export function App() {
 
     return `curl -fsSL '${window.location.origin}/start?session=${sessionId}' | sh`;
   }, [sessionId]);
-  const powershellBootstrapCommand = useMemo(() => {
+  const windowsBootstrapCommand = useMemo(() => {
     if (!sessionId || typeof window === "undefined") {
       return "";
     }
 
-    return `& ([ScriptBlock]::Create((irm '${window.location.origin}/start.ps1?session=${sessionId}')))`;
+    return `irm '${window.location.origin}/start.ps1?session=${sessionId}' | iex`;
   }, [sessionId]);
   const platformCommand = useMemo(() => {
     if (selectedPlatform === "windows") {
-      return powershellBootstrapCommand;
+      return windowsBootstrapCommand;
     }
     return shellBootstrapCommand;
-  }, [powershellBootstrapCommand, selectedPlatform, shellBootstrapCommand]);
+  }, [selectedPlatform, shellBootstrapCommand, windowsBootstrapCommand]);
 
   useEffect(() => {
     canWriteRef.current = Boolean(sessionStatus?.canWrite);
@@ -363,7 +363,7 @@ export function App() {
     };
   }, [sessionId]);
 
-  async function createSession() {
+  async function createSession(options: { openInNewTab?: boolean } = {}) {
     setCreating(true);
     try {
       const response = await fetch("/api/session", { method: "POST" });
@@ -372,6 +372,13 @@ export function App() {
       }
 
       const created = (await response.json()) as SessionInfo;
+      const createdInfo = normalizeSessionInfo(created);
+
+      if (options.openInNewTab) {
+        window.open(createdInfo.viewerUrl, "_blank", "noopener,noreferrer");
+        return;
+      }
+
       suppressReconnectRef.current = true;
       if (reconnectTimer.current !== null) {
         window.clearTimeout(reconnectTimer.current);
@@ -381,7 +388,6 @@ export function App() {
       inputCleanup.current = null;
       socket.current?.close();
       socket.current = null;
-      const createdInfo = normalizeSessionInfo(created);
       setSessionId(created.sessionId);
       reconnectAttempts.current = 0;
       window.history.replaceState({}, "", createdInfo.viewerUrl);
@@ -391,12 +397,16 @@ export function App() {
       setTransportState("idle");
       setConnecting(false);
       terminal.current?.reset();
-      terminal.current?.writeln("Session created.");
-      terminal.current?.writeln("Waiting for host agent to attach...");
     } finally {
       suppressReconnectRef.current = false;
       setCreating(false);
     }
+  }
+
+  function handleCreateSessionClick(event: React.MouseEvent<HTMLButtonElement>) {
+    void createSession({
+      openInNewTab: event.metaKey || event.ctrlKey || event.shiftKey,
+    });
   }
 
   async function handleCopy(
@@ -556,9 +566,15 @@ export function App() {
               </h2>
               <button
                 type="button"
-                onClick={() => void createSession()}
+                onClick={handleCreateSessionClick}
+                onAuxClick={(event) => {
+                  if (event.button === 1) {
+                    event.preventDefault();
+                    void createSession({ openInNewTab: true });
+                  }
+                }}
                 disabled={creating}
-                className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-stone-300 transition hover:bg-white/10 hover:text-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+                className="rounded-full border border-amber-400/60 bg-amber-400/10 px-3.5 py-1.5 text-xs font-semibold text-amber-200 shadow-[0_0_20px_rgba(251,191,36,0.12)] transition hover:border-amber-300 hover:bg-amber-400/20 hover:text-amber-100 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/10 disabled:text-stone-500 disabled:shadow-none"
               >
                 {creating ? "Creating..." : sessionId ? "New session" : "Create session"}
               </button>
@@ -617,26 +633,6 @@ export function App() {
               <div className="min-w-0 rounded-2xl border border-white/10 bg-black/20 p-3">
                 <div className="flex items-center justify-between gap-3">
                   <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
-                    Share URL
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void handleCopy(shareUrl, setShareCopyLabel, shareCopyTimerRef)
-                    }
-                    disabled={!shareUrl}
-                    className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-stone-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {shareCopyLabel}
-                  </button>
-                </div>
-                <p className="mt-2 min-w-0 max-w-full overflow-x-auto whitespace-nowrap rounded-xl border border-white/8 bg-black/20 px-3 py-2 text-sm text-stone-200">
-                  {shareUrl || "Create a session to get a shareable URL."}
-                </p>
-              </div>
-              <div className="min-w-0 rounded-2xl border border-white/10 bg-black/20 p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
                     Start host
                   </p>
                   <button
@@ -674,6 +670,26 @@ export function App() {
                 <p className="mt-3 min-w-0 max-w-full overflow-x-auto whitespace-nowrap rounded-xl border border-white/8 bg-black/20 px-3 py-2 font-mono text-sm text-stone-200">
                   {platformCommand ||
                     "Create a session to get the bootstrap command for this platform."}
+                </p>
+              </div>
+              <div className="min-w-0 rounded-2xl border border-white/10 bg-black/20 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-xs uppercase tracking-[0.22em] text-stone-500">
+                    Share URL
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleCopy(shareUrl, setShareCopyLabel, shareCopyTimerRef)
+                    }
+                    disabled={!shareUrl}
+                    className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-stone-300 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {shareCopyLabel}
+                  </button>
+                </div>
+                <p className="mt-2 min-w-0 max-w-full overflow-x-auto whitespace-nowrap rounded-xl border border-white/8 bg-black/20 px-3 py-2 text-sm text-stone-200">
+                  {shareUrl || "Create a session to get a shareable URL."}
                 </p>
               </div>
             </div>
