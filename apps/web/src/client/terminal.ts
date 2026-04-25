@@ -8,7 +8,7 @@ export type TerminalController = {
   fit: () => { cols: number; rows: number };
   onData: (handler: (value: string) => void) => () => void;
   reset: () => void;
-  write: (value: string) => void;
+  write: (value: string | Uint8Array) => void;
   writeln: (value: string) => void;
 };
 

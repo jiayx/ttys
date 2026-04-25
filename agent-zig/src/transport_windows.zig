@@ -1,5 +1,6 @@
 const std = @import("std");
 const sync = @import("sync.zig");
+const transport_message = @import("transport_message.zig");
 
 const c = @cImport({
     @cDefine("_WIN32_WINNT", "0x0A00");
@@ -8,12 +9,18 @@ const c = @cImport({
 });
 
 const Allocator = std.mem.Allocator;
+const ByteList = std.array_list.Managed(u8);
 const Mutex = sync.Mutex;
+
+pub const MessageKind = transport_message.Kind;
+pub const Message = transport_message.Message;
+pub const BinaryType = transport_message.BinaryType;
 
 pub fn globalInit() !void {}
 pub fn globalDeinit() void {}
 
 pub const WebSocketClient = struct {
+    allocator: Allocator,
     session: c.HINTERNET,
     connection: c.HINTERNET,
     websocket: c.HINTERNET,
@@ -80,6 +87,7 @@ pub const WebSocketClient = struct {
         if (websocket == null) return error.WebSocketUpgradeFailed;
 
         return .{
+            .allocator = allocator,
             .session = session,
             .connection = connection,
             .websocket = websocket,
@@ -93,7 +101,13 @@ pub const WebSocketClient = struct {
         _ = c.WinHttpCloseHandle(self.session);
     }
 
-    pub fn writeText(self: *WebSocketClient, bytes: []const u8) !void {
+    pub fn writeBinaryMessage(self: *WebSocketClient, kind: BinaryType, bytes: []const u8) !void {
+        const wrapped = try transport_message.wrapBinary(self.allocator, kind, bytes);
+        defer self.allocator.free(wrapped);
+        try self.writeMessage(wrapped, .binary);
+    }
+
+    fn writeMessage(self: *WebSocketClient, bytes: []const u8, kind: MessageKind) !void {
         if (bytes.len == 0) return;
         self.lock.lock();
         defer self.lock.unlock();
@@ -102,23 +116,22 @@ pub const WebSocketClient = struct {
         while (offset < bytes.len) {
             const remaining = bytes.len - offset;
             const chunk_len: usize = @min(remaining, std.math.maxInt(c.DWORD));
-            const kind: c.WINHTTP_WEB_SOCKET_BUFFER_TYPE = if (offset + chunk_len == bytes.len)
-                c.WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE
-            else
-                c.WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE;
-            const rc = c.WinHttpWebSocketSend(self.websocket, kind, @constCast(bytes.ptr + offset), @intCast(chunk_len));
+            const buffer_type = winhttpBufferType(kind, offset + chunk_len == bytes.len);
+            const rc = c.WinHttpWebSocketSend(self.websocket, buffer_type, @constCast(bytes.ptr + offset), @intCast(chunk_len));
             if (rc != c.NO_ERROR) return error.WebSocketSendFailed;
             offset += chunk_len;
         }
     }
 
     pub fn writeJSON(self: *WebSocketClient, text: []const u8) !void {
-        try self.writeText(text);
+        try self.writeMessage(text, .text);
     }
 
-    pub fn readTextAlloc(self: *WebSocketClient, allocator: Allocator) !?[]u8 {
-        var result = std.array_list.Managed(u8).init(allocator);
+    pub fn readMessageAlloc(self: *WebSocketClient, allocator: Allocator) !?Message {
+        var result = ByteList.init(allocator);
         errdefer result.deinit();
+
+        var message_kind: ?MessageKind = null;
 
         while (true) {
             var buf: [4096]u8 = undefined;
@@ -140,10 +153,25 @@ pub const WebSocketClient = struct {
 
             switch (buffer_type) {
                 c.WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE => return error.ConnectionClosed,
-                c.WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE => try result.appendSlice(buf[0..read_len]),
-                c.WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE => {
+                c.WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE => {
+                    if (message_kind != null and message_kind.? != .text) return error.MixedWebSocketFragments;
+                    message_kind = .text;
                     try result.appendSlice(buf[0..read_len]);
-                    break;
+                },
+                c.WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE => {
+                    if (message_kind != null and message_kind.? != .text) return error.MixedWebSocketFragments;
+                    try result.appendSlice(buf[0..read_len]);
+                    return .{ .kind = .text, .payload = try result.toOwnedSlice() };
+                },
+                c.WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE => {
+                    if (message_kind != null and message_kind.? != .binary) return error.MixedWebSocketFragments;
+                    message_kind = .binary;
+                    try result.appendSlice(buf[0..read_len]);
+                },
+                c.WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE => {
+                    if (message_kind != null and message_kind.? != .binary) return error.MixedWebSocketFragments;
+                    try result.appendSlice(buf[0..read_len]);
+                    return .{ .kind = .binary, .payload = try result.toOwnedSlice() };
                 },
                 else => {
                     if (result.items.len == 0) return null;
@@ -151,9 +179,26 @@ pub const WebSocketClient = struct {
             }
         }
 
-        return try result.toOwnedSlice();
+        return .{
+            .kind = message_kind orelse .text,
+            .payload = try result.toOwnedSlice(),
+        };
     }
+
 };
+
+fn winhttpBufferType(kind: MessageKind, final: bool) c.WINHTTP_WEB_SOCKET_BUFFER_TYPE {
+    return switch (kind) {
+        .text => if (final)
+            c.WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE
+        else
+            c.WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE,
+        .binary => if (final)
+            c.WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE
+        else
+            c.WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE,
+    };
+}
 
 fn buildPathAndQuery(allocator: Allocator, uri: std.Uri) ![]u8 {
     var list = std.array_list.Managed(u8).init(allocator);

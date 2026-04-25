@@ -1,10 +1,15 @@
 const std = @import("std");
 const sync = @import("sync.zig");
+const transport_message = @import("transport_message.zig");
 const websocket = @import("websocket.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Mutex = sync.Mutex;
+
+pub const MessageKind = transport_message.Kind;
+pub const Message = transport_message.Message;
+pub const BinaryType = transport_message.BinaryType;
 
 pub fn globalInit() !void {}
 pub fn globalDeinit() void {}
@@ -78,42 +83,43 @@ pub const WebSocketClient = struct {
         self.client.allocator.destroy(self.client);
     }
 
-    pub fn writeText(self: *WebSocketClient, bytes: []const u8) !void {
-        try self.writeMessage(bytes, .text);
+    pub fn writeBinaryMessage(self: *WebSocketClient, kind: BinaryType, bytes: []const u8) !void {
+        const wrapped = try transport_message.wrapBinary(self.client.allocator, kind, bytes);
+        defer self.client.allocator.free(wrapped);
+        try self.writeMessage(wrapped, .binary);
     }
 
     pub fn writeJSON(self: *WebSocketClient, text: []const u8) !void {
-        try self.writeText(text);
+        try self.writeMessage(text, .text);
     }
 
-    pub fn readTextAlloc(self: *WebSocketClient, allocator: Allocator) !?[]u8 {
-        var result = std.array_list.Managed(u8).init(allocator);
-        errdefer result.deinit();
-
+    pub fn readMessageAlloc(self: *WebSocketClient, allocator: Allocator) !?Message {
+        _ = allocator;
         while (true) {
             const message = try self.codec.readMessageAlloc(self.connection.reader());
-            defer self.codec.allocator.free(message.payload);
 
             switch (message.kind) {
-                .pong => continue,
+                .pong => {
+                    self.codec.allocator.free(message.payload);
+                    continue;
+                },
                 .ping => {
+                    defer self.codec.allocator.free(message.payload);
                     try self.writeMessage(message.payload, .pong);
                     continue;
                 },
                 .close => {
+                    defer self.codec.allocator.free(message.payload);
                     self.writeMessage(message.payload, .close) catch {};
                     return error.ConnectionClosed;
                 },
-                .text => {
-                    try result.appendSlice(message.payload);
-                    return try result.toOwnedSlice();
-                },
-                else => continue,
+                .text => return .{ .kind = .text, .payload = message.payload },
+                .binary => return .{ .kind = .binary, .payload = message.payload },
             }
         }
     }
 
-    fn writeMessage(self: *WebSocketClient, data: []const u8, opcode: Opcode) !void {
+    fn writeMessage(self: *WebSocketClient, data: []const u8, opcode: websocket.MessageKind) !void {
         self.write_lock.lock();
         defer self.write_lock.unlock();
 
@@ -125,8 +131,6 @@ pub const WebSocketClient = struct {
         try self.connection.flush();
     }
 };
-
-const Opcode = websocket.MessageKind;
 
 fn verifyUpgradeHeaders(head: std.http.Client.Response.Head, key_b64: []const u8) !void {
     const expected_accept = websocket.acceptKey(key_b64);

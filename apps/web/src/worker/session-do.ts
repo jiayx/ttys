@@ -1,4 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
+import {
+  BinaryMessageType,
+  arrayBufferToBase64,
+  binarySocketDataToArrayBuffer,
+  decodeBinaryMessage,
+  type BackfillChunk,
+} from "../protocol";
 
 type SessionState = "idle" | "ready" | "active" | "closed";
 type SessionRole = "host" | "viewer";
@@ -21,7 +28,7 @@ export class TTYSession extends DurableObject {
   private viewers = new Map<WebSocket, ViewerInfo>();
   private state: SessionState = "idle";
   private hostConnected = false;
-  private buffer: string[] = [];
+  private buffer: BackfillChunk[] = [];
   private currentControllerId: string | null = null;
   private controlLeaseExpiresAt: number | null = null;
   private pendingRequest: ControlRequest | null = null;
@@ -117,7 +124,7 @@ export class TTYSession extends DurableObject {
   private async handleMessage(
     role: SessionRole,
     socket: WebSocket,
-    data: string | ArrayBuffer,
+    data: unknown,
   ) {
     this.advanceState();
 
@@ -139,24 +146,56 @@ export class TTYSession extends DurableObject {
           await this.scheduleNextAlarm();
           return;
         }
-        this.pushBuffer(data);
+        return;
       }
 
+      const buffer = await binarySocketDataToArrayBuffer(data);
+      if (!buffer) {
+        socket.close(1003, "unsupported binary message container");
+        return;
+      }
+
+      const binary = decodeBinaryMessage(buffer);
+      if (binary?.messageType !== BinaryMessageType.ttyOutput) {
+        socket.close(1003, "invalid host binary message");
+        return;
+      }
+
+      this.pushBuffer({
+        messageType: binary.messageType,
+        data: arrayBufferToBase64(binary.payload),
+      });
+
       for (const viewer of this.viewers.values()) {
-        viewer.socket.send(data);
+        viewer.socket.send(buffer);
       }
       return;
     }
 
-    const frame = typeof data === "string" ? parseEnvelope(data) : null;
+    if (typeof data !== "string") {
+      const buffer = await binarySocketDataToArrayBuffer(data);
+      if (!buffer) {
+        socket.close(1003, "unsupported binary message container");
+        return;
+      }
+
+      const binary = decodeBinaryMessage(buffer);
+      if (binary?.messageType !== BinaryMessageType.stdin) {
+        socket.close(1003, "invalid viewer binary message");
+        return;
+      }
+
+      if (this.canWrite(socket)) {
+        this.host?.send(buffer);
+      }
+      return;
+    }
+
+    const frame = parseEnvelope(data);
     if (frame?.type === "control.request") {
       this.handleControlRequest(socket, frame.payload);
       await this.scheduleNextAlarm();
       return;
-    }
-
-    if (frame?.type === "stdin" && this.canWrite(socket)) {
-      this.host?.send(data);
     }
   }
 
@@ -260,7 +299,7 @@ export class TTYSession extends DurableObject {
     return viewer?.id === this.currentControllerId;
   }
 
-  private pushBuffer(chunk: string) {
+  private pushBuffer(chunk: BackfillChunk) {
     this.buffer.push(chunk);
     if (this.buffer.length > 64) {
       this.buffer.shift();

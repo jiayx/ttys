@@ -128,11 +128,13 @@ const SharedOutput = struct {
     fn forward(self: *SharedOutput, bytes: []const u8) !void {
         if (bytes.len == 0) return;
 
-        self.stdout_lock.lock();
-        defer self.stdout_lock.unlock();
-        try writeStdoutAll(bytes);
+        {
+            self.stdout_lock.lock();
+            defer self.stdout_lock.unlock();
+            try writeStdoutAll(bytes);
+        }
 
-        try self.websocket.writeText(bytes);
+        try self.websocket.writeBinaryMessage(.tty_output, bytes);
     }
 
     fn beep(self: *SharedOutput) !void {
@@ -414,11 +416,16 @@ pub fn main(init: std.process.Init) !void {
         .ws = &ws,
     };
 
-    _ = try std.Thread.spawn(.{}, ptyReaderMain, .{&context});
-    _ = try std.Thread.spawn(.{}, websocketReaderMain, .{&context});
-    _ = try std.Thread.spawn(.{}, stdinMain, .{&context});
-    _ = try std.Thread.spawn(.{}, resizeMain, .{&context});
-    _ = try std.Thread.spawn(.{}, childWaitMain, .{&context});
+    const pty_reader_thread = try std.Thread.spawn(.{}, ptyReaderMain, .{&context});
+    pty_reader_thread.detach();
+    const websocket_reader_thread = try std.Thread.spawn(.{}, websocketReaderMain, .{&context});
+    websocket_reader_thread.detach();
+    const stdin_thread = try std.Thread.spawn(.{}, stdinMain, .{&context});
+    stdin_thread.detach();
+    const resize_thread = try std.Thread.spawn(.{}, resizeMain, .{&context});
+    resize_thread.detach();
+    const child_wait_thread = try std.Thread.spawn(.{}, childWaitMain, .{&context});
+    child_wait_thread.detach();
 
     const err = state.wait();
 
@@ -453,7 +460,7 @@ fn ptyReaderMain(ctx: *ThreadContext) void {
 
 fn websocketReaderMain(ctx: *ThreadContext) void {
     while (!ctx.state.isDone()) {
-        const maybe_text = ctx.ws.readTextAlloc(ctx.allocator) catch |err| switch (err) {
+        const maybe_message = ctx.ws.readMessageAlloc(ctx.allocator) catch |err| switch (err) {
             error.ConnectionClosed => {
                 ctx.state.finishOk();
                 return;
@@ -464,17 +471,23 @@ fn websocketReaderMain(ctx: *ThreadContext) void {
             },
         };
 
-        if (maybe_text == null) {
+        if (maybe_message == null) {
             sleepMillis(10);
             continue;
         }
 
-        const text = maybe_text.?;
-        defer ctx.allocator.free(text);
-        handleControlFrame(ctx, text) catch |err| {
-            ctx.state.finishErrFmt("frame handling failed: {s}", .{@errorName(err)});
-            return;
-        };
+        const message = maybe_message.?;
+        defer ctx.allocator.free(message.payload);
+        switch (message.kind) {
+            .text => handleControlFrame(ctx, message.payload) catch |err| {
+                ctx.state.finishErrFmt("frame handling failed: {s}", .{@errorName(err)});
+                return;
+            },
+            .binary => handleBinaryFrame(ctx, message.payload) catch |err| {
+                ctx.state.finishErrFmt("binary frame handling failed: {s}", .{@errorName(err)});
+                return;
+            },
+        }
     }
 }
 
@@ -548,18 +561,18 @@ fn handleControlFrame(ctx: *ThreadContext, payload: []const u8) !void {
     const payload_value = root.get("payload") orelse return;
     const frame_type_string = frame_type.string;
 
-    if (std.mem.eql(u8, frame_type_string, "stdin")) {
-        if (payload_value != .object) return;
-        const data_value = payload_value.object.get("data") orelse return;
-        if (data_value != .string) return;
-        try writeAllPTY(ctx.pty, data_value.string);
-        return;
-    }
-
     if (std.mem.eql(u8, frame_type_string, "session.status")) {
         const status = try std.json.parseFromValue(SessionStatusPayload, ctx.allocator, payload_value, .{ .ignore_unknown_fields = true });
         defer status.deinit();
         try ctx.modal.syncPendingRequest(status.value.pendingControlRequest, ctx.output);
+    }
+}
+
+fn handleBinaryFrame(ctx: *ThreadContext, payload: []const u8) !void {
+    const frame = try transport_mod.unwrapBinary(payload);
+    switch (frame.kind) {
+        .stdin => try writeAllPTY(ctx.pty, frame.data),
+        .tty_output => {},
     }
 }
 
@@ -666,6 +679,10 @@ fn createSession(allocator: Allocator, io: std.Io, base_url: []const u8) !Connec
 }
 
 fn httpPostAlloc(allocator: Allocator, io: std.Io, url: []const u8) ![]u8 {
+    return try httpPostAllocRedirects(allocator, io, url, 3);
+}
+
+fn httpPostAllocRedirects(allocator: Allocator, io: std.Io, url: []const u8, redirects_left: usize) ![]u8 {
     var client: std.http.Client = .{
         .allocator = allocator,
         .io = io,
@@ -683,6 +700,13 @@ fn httpPostAlloc(allocator: Allocator, io: std.Io, url: []const u8) ![]u8 {
 
     var response = try request.receiveHead(&.{});
     var reader = response.reader(&.{});
+    if (isRedirectStatus(response.head.status)) {
+        if (redirects_left == 0) return error.TooManyRedirects;
+        const location = responseLocation(response.head) orelse return error.RedirectMissingLocation;
+        const next_url = try resolveRelativeURL(allocator, url, location);
+        return try httpPostAllocRedirects(allocator, io, next_url, redirects_left - 1);
+    }
+
     if (response.head.status != .ok) {
         const body = try reader.allocRemaining(allocator, .limited(4 << 10));
         defer allocator.free(body);
@@ -698,6 +722,21 @@ fn httpPostAlloc(allocator: Allocator, io: std.Io, url: []const u8) ![]u8 {
     }
 
     return try reader.allocRemaining(allocator, .limited(4 << 10));
+}
+
+fn isRedirectStatus(status: std.http.Status) bool {
+    return switch (status) {
+        .moved_permanently, .found, .see_other, .temporary_redirect, .permanent_redirect => true,
+        else => false,
+    };
+}
+
+fn responseLocation(head: std.http.Client.Response.Head) ?[]const u8 {
+    var it = head.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "location")) return header.value;
+    }
+    return null;
 }
 
 const ParsedFlagValue = struct {

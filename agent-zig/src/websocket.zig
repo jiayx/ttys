@@ -195,10 +195,14 @@ fn readFrameAlloc(allocator: Allocator, reader: *std.Io.Reader, max_message_size
     }
     if (payload_len > max_message_size) return error.MessageTooLarge;
 
+    const payload = try reader.readAlloc(allocator, payload_len);
+    errdefer allocator.free(payload);
+    if (opcode == .close) try validateClosePayload(payload);
+
     return .{
         .fin = fin,
         .opcode = opcode,
-        .payload = try reader.readAlloc(allocator, payload_len),
+        .payload = payload,
     };
 }
 
@@ -244,6 +248,23 @@ fn parseOpcode(value: u8) ?Opcode {
         9 => .ping,
         10 => .pong,
         else => null,
+    };
+}
+
+fn validateClosePayload(payload: []const u8) !void {
+    if (payload.len == 0) return;
+    if (payload.len == 1) return error.InvalidCloseFrame;
+
+    const code = std.mem.readInt(u16, payload[0..2], .big);
+    if (!isValidCloseCode(code)) return error.InvalidCloseCode;
+    if (!std.unicode.utf8ValidateSlice(payload[2..])) return error.InvalidCloseReason;
+}
+
+fn isValidCloseCode(code: u16) bool {
+    return switch (code) {
+        1000...1003, 1007...1014 => true,
+        3000...4999 => true,
+        else => false,
     };
 }
 
@@ -305,6 +326,35 @@ test "readMessageAlloc rejects non-canonical extended length" {
     defer codec.deinit();
 
     try std.testing.expectError(error.NonCanonicalLength, codec.readMessageAlloc(&reader));
+}
+
+test "readMessageAlloc rejects invalid close payloads" {
+    {
+        var input = [_]u8{ 0x88, 0x01, 0x03 };
+        var reader: std.Io.Reader = .fixed(&input);
+        var codec = Codec.init(std.testing.allocator, .{});
+        defer codec.deinit();
+
+        try std.testing.expectError(error.InvalidCloseFrame, codec.readMessageAlloc(&reader));
+    }
+
+    {
+        var input = [_]u8{ 0x88, 0x02, 0x03, 0xee };
+        var reader: std.Io.Reader = .fixed(&input);
+        var codec = Codec.init(std.testing.allocator, .{});
+        defer codec.deinit();
+
+        try std.testing.expectError(error.InvalidCloseCode, codec.readMessageAlloc(&reader));
+    }
+
+    {
+        var input = [_]u8{ 0x88, 0x03, 0x03, 0xe8, 0xff };
+        var reader: std.Io.Reader = .fixed(&input);
+        var codec = Codec.init(std.testing.allocator, .{});
+        defer codec.deinit();
+
+        try std.testing.expectError(error.InvalidCloseReason, codec.readMessageAlloc(&reader));
+    }
 }
 
 test "readMessageAlloc combines fragmented text with interleaved ping" {

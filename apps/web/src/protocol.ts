@@ -1,0 +1,57 @@
+export type BackfillChunk = { messageType: number; data: string };
+
+export const BinaryMessageType = {
+  ttyOutput: 0x01,
+  stdin: 0x02,
+} as const;
+
+export async function binarySocketDataToArrayBuffer(
+  data: unknown,
+): Promise<ArrayBuffer | null> {
+  if (data instanceof ArrayBuffer) {
+    return data;
+  }
+  if (typeof Blob !== "undefined" && data instanceof Blob) {
+    return data.arrayBuffer();
+  }
+  return null;
+}
+
+export function decodeBinaryMessage(
+  buffer: ArrayBuffer,
+): { messageType: number; payload: ArrayBuffer } | null {
+  if (buffer.byteLength === 0) {
+    return null;
+  }
+  const bytes = new Uint8Array(buffer);
+  return {
+    messageType: bytes[0],
+    payload: buffer.slice(1),
+  };
+}
+
+export function encodeBinaryMessage(messageType: number, payload: Uint8Array): ArrayBuffer {
+  const message = new Uint8Array(payload.length + 1);
+  message[0] = messageType;
+  message.set(payload, 1);
+  return message.buffer;
+}
+
+export function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    const chunk = bytes.subarray(offset, offset + 0x8000);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+export function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}

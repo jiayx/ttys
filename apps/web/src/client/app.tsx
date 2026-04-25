@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { mountTerminal, type TerminalController } from "./terminal";
+import {
+  BinaryMessageType,
+  base64ToBytes,
+  binarySocketDataToArrayBuffer,
+  encodeBinaryMessage,
+  type BackfillChunk,
+} from "../protocol";
 
 type SessionInfo = {
   sessionId: string;
@@ -203,6 +210,7 @@ export function App() {
       const ws = new WebSocket(
         sessionInfo?.viewerWebSocketUrl ?? viewerSocketURL(currentSessionId),
       );
+      ws.binaryType = "arraybuffer";
       activeSocket = ws;
       socket.current = ws;
       const wasReconnect = reconnectAttempts.current > 0;
@@ -222,18 +230,18 @@ export function App() {
         reconnectAttempts.current = 0;
       });
 
-      ws.addEventListener("message", (event) => {
-        if (typeof event.data !== "string") {
+      ws.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const data = event.data;
+        if (typeof data !== "string") {
+          void handleBinarySocketMessage(data, ws, terminal.current);
           return;
         }
 
-        const parsed = parseControlFrame(event.data);
+        const parsed = parseControlFrame(data);
         if (parsed) {
           handleControlFrame(parsed);
           return;
         }
-
-        terminal.current?.write(event.data);
       });
 
       ws.addEventListener("close", () => {
@@ -264,7 +272,7 @@ export function App() {
           flashRequestControlButton();
           return;
         }
-        ws.send(JSON.stringify({ type: "stdin", payload: { data: value } }));
+        ws.send(encodeBinaryMessage(BinaryMessageType.stdin, new TextEncoder().encode(value)));
       }) ?? null;
     }
 
@@ -346,9 +354,11 @@ export function App() {
       }
 
       if (frame.type === "session.backfill") {
-        const chunks = ((frame.payload as { chunks?: string[] }).chunks ?? []).join("");
-        if (chunks) {
-          terminal.current?.write(chunks);
+        const chunks = (frame.payload as { chunks?: BackfillChunk[] }).chunks ?? [];
+        for (const chunk of chunks) {
+          if (chunk.messageType === BinaryMessageType.ttyOutput) {
+            terminal.current?.write(base64ToBytes(chunk.data));
+          }
         }
       }
     }
@@ -683,6 +693,35 @@ export function App() {
       </section>
     </main>
   );
+}
+
+async function handleBinarySocketMessage(
+  data: unknown,
+  ws: WebSocket,
+  terminal: TerminalController | null,
+) {
+  const buffer = await binarySocketDataToArrayBuffer(data);
+  if (!buffer) {
+    ws.close(1003, "unsupported binary message container");
+    return;
+  }
+
+  handleBinaryMessage(buffer, terminal);
+}
+
+function handleBinaryMessage(buffer: ArrayBuffer, terminal: TerminalController | null) {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length === 0) {
+    return;
+  }
+
+  switch (bytes[0]) {
+    case BinaryMessageType.ttyOutput:
+      terminal?.write(bytes.subarray(1));
+      return;
+    default:
+      return;
+  }
 }
 
 function readSessionId() {
