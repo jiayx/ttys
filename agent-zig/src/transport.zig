@@ -6,6 +6,7 @@ const impl = switch (builtin.os.tag) {
 };
 
 pub const WebSocketClient = impl.WebSocketClient;
+pub const BinaryType = impl.BinaryType;
 pub const globalInit = impl.globalInit;
 pub const globalDeinit = impl.globalDeinit;
 pub const unwrapBinary = @import("transport_message.zig").unwrapBinary;

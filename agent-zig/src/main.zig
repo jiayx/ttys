@@ -25,6 +25,7 @@ const TerminalSize = terminal_mod.TerminalSize;
 const getTerminalSize = terminal_mod.getTerminalSize;
 const WebSocketClient = transport_mod.WebSocketClient;
 const Mutex = sync.Mutex;
+const nested_agent_env = "TTYS_AGENT_ACTIVE";
 
 const Config = struct {
     server_url: []const u8 = "http://127.0.0.1:8787",
@@ -121,9 +122,53 @@ const RunState = struct {
     }
 };
 
+const WebSocketSlot = struct {
+    lock: Mutex = .{},
+    client: ?*WebSocketClient = null,
+
+    fn setConnected(self: *WebSocketSlot, client: *WebSocketClient) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.client = client;
+    }
+
+    fn setDisconnected(self: *WebSocketSlot, client: *WebSocketClient) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.client == client) {
+            self.client = null;
+        }
+    }
+
+    fn closeCurrent(self: *WebSocketSlot) void {
+        self.lock.lock();
+        const client = self.client;
+        self.client = null;
+        self.lock.unlock();
+
+        if (client) |value| {
+            value.close();
+        }
+    }
+
+    fn writeBinaryMessage(self: *WebSocketSlot, kind: transport_mod.BinaryType, bytes: []const u8) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const client = self.client orelse return error.WebSocketDisconnected;
+        try client.writeBinaryMessage(kind, bytes);
+    }
+
+    fn writeJSON(self: *WebSocketSlot, text: []const u8) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        const client = self.client orelse return error.WebSocketDisconnected;
+        try client.writeJSON(text);
+    }
+};
+
 const SharedOutput = struct {
     stdout_lock: Mutex = .{},
-    websocket: *WebSocketClient,
+    websocket: *WebSocketSlot,
 
     fn forward(self: *SharedOutput, bytes: []const u8) !void {
         if (bytes.len == 0) return;
@@ -134,7 +179,7 @@ const SharedOutput = struct {
             try writeStdoutAll(bytes);
         }
 
-        try self.websocket.writeBinaryMessage(.tty_output, bytes);
+        self.websocket.writeBinaryMessage(.tty_output, bytes) catch {};
     }
 
     fn beep(self: *SharedOutput) !void {
@@ -367,16 +412,24 @@ const ApprovalModal = struct {
 
 const ThreadContext = struct {
     allocator: Allocator,
+    io: std.Io,
+    host_websocket_url: []const u8,
     state: *RunState,
     pty: *PTY,
     modal: *ApprovalModal,
     output: *SharedOutput,
-    ws: *WebSocketClient,
+    ws: *WebSocketSlot,
 };
 
 pub fn main(init: std.process.Init) !void {
     try transport_mod.globalInit();
     defer transport_mod.globalDeinit();
+
+    if (init.environ_map.contains(nested_agent_env)) {
+        try writeStderrAll("ttys-agent is already active in this terminal session.\n");
+        try writeStderrAll("Open a new local terminal, or exit the current shared shell before starting another agent.\n");
+        return;
+    }
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -395,7 +448,7 @@ pub fn main(init: std.process.Init) !void {
     const raw_terminal = try RawTerminal.enter();
     defer raw_terminal.leave();
 
-    var ws = try WebSocketClient.connect(allocator, init.io, connect_info.host_websocket_url);
+    var ws = WebSocketSlot{};
 
     var output = SharedOutput{ .websocket = &ws };
     var modal = ApprovalModal.init(allocator);
@@ -409,6 +462,8 @@ pub fn main(init: std.process.Init) !void {
     var state = RunState{ .allocator = allocator };
     var context = ThreadContext{
         .allocator = allocator,
+        .io = init.io,
+        .host_websocket_url = connect_info.host_websocket_url,
         .state = &state,
         .pty = &pty,
         .modal = &modal,
@@ -418,7 +473,7 @@ pub fn main(init: std.process.Init) !void {
 
     const pty_reader_thread = try std.Thread.spawn(.{}, ptyReaderMain, .{&context});
     pty_reader_thread.detach();
-    const websocket_reader_thread = try std.Thread.spawn(.{}, websocketReaderMain, .{&context});
+    const websocket_reader_thread = try std.Thread.spawn(.{}, websocketMain, .{&context});
     websocket_reader_thread.detach();
     const stdin_thread = try std.Thread.spawn(.{}, stdinMain, .{&context});
     stdin_thread.detach();
@@ -428,6 +483,7 @@ pub fn main(init: std.process.Init) !void {
     child_wait_thread.detach();
 
     const err = state.wait();
+    ws.closeCurrent();
 
     if (err) |message| {
         try writeStderrAll(message);
@@ -458,19 +514,30 @@ fn ptyReaderMain(ctx: *ThreadContext) void {
     }
 }
 
-fn websocketReaderMain(ctx: *ThreadContext) void {
+fn websocketMain(ctx: *ThreadContext) void {
+    var delay_ms: u64 = 250;
     while (!ctx.state.isDone()) {
-        const maybe_message = ctx.ws.readMessageAlloc(ctx.allocator) catch |err| switch (err) {
-            error.ConnectionClosed => {
-                ctx.state.finishOk();
-                return;
-            },
-            else => {
-                ctx.state.finishErrFmt("websocket read failed: {s}", .{@errorName(err)});
-                return;
-            },
+        var ws = WebSocketClient.connect(ctx.allocator, ctx.io, ctx.host_websocket_url) catch {
+            sleepMillis(delay_ms);
+            delay_ms = @min(delay_ms * 2, 5000);
+            continue;
         };
+        delay_ms = 250;
+        ctx.ws.setConnected(&ws);
 
+        readWebSocketLoop(ctx, &ws);
+
+        ctx.ws.setDisconnected(&ws);
+        ws.close();
+        if (!ctx.state.isDone()) {
+            sleepMillis(delay_ms);
+        }
+    }
+}
+
+fn readWebSocketLoop(ctx: *ThreadContext, ws: *WebSocketClient) void {
+    while (!ctx.state.isDone()) {
+        const maybe_message = ws.readMessageAlloc(ctx.allocator) catch return;
         if (maybe_message == null) {
             sleepMillis(10);
             continue;
@@ -599,7 +666,7 @@ fn sendDecision(ctx: *ThreadContext, decision: ModalDecision) !void {
         },
     }
 
-    try ctx.ws.writeJSON(message.items);
+    ctx.ws.writeJSON(message.items) catch {};
 }
 
 fn parseArgs(allocator: Allocator, process_args: std.process.Args) !Config {

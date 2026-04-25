@@ -6,6 +6,7 @@ const c = if (builtin.os.tag == .linux) @cImport({
     @cInclude("pty.h");
     @cInclude("poll.h");
     @cInclude("signal.h");
+    @cInclude("stdlib.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/wait.h");
     @cInclude("unistd.h");
@@ -13,6 +14,7 @@ const c = if (builtin.os.tag == .linux) @cImport({
     @cInclude("errno.h");
     @cInclude("poll.h");
     @cInclude("signal.h");
+    @cInclude("stdlib.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/wait.h");
     @cInclude("unistd.h");
@@ -29,6 +31,8 @@ pub const PTY = struct {
         if (pid < 0) return error.ForkPTYFailed;
 
         if (pid == 0) {
+            _ = c.setenv("TTYS_AGENT_ACTIVE", "1", 1);
+
             const shell_z = std.heap.c_allocator.dupeZ(u8, shell) catch c._exit(127);
             defer std.heap.c_allocator.free(shell_z);
 

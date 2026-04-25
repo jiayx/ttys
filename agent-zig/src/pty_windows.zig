@@ -7,6 +7,8 @@ const c = @cImport({
 
 const proc_thread_attribute_pseudo_console = 0x00020016;
 const extended_startup_info_present = 0x00080000;
+const nested_agent_env_name = std.unicode.utf8ToUtf16LeStringLiteral("TTYS_AGENT_ACTIVE");
+const nested_agent_env_value = std.unicode.utf8ToUtf16LeStringLiteral("1");
 
 pub const PTY = struct {
     input: c.HANDLE,
@@ -41,6 +43,9 @@ pub const PTY = struct {
         defer std.heap.c_allocator.free(cmdline);
 
         var pi: c.PROCESS_INFORMATION = std.mem.zeroInit(c.PROCESS_INFORMATION, .{});
+        const marker = try ChildEnvMarker.set();
+        defer marker.restore();
+
         if (c.CreateProcessW(
             null,
             cmdline.ptr,
@@ -105,6 +110,42 @@ pub const PTY = struct {
         if (exit_code != 0) return error.ProcessExitedNonZero;
     }
 };
+
+const ChildEnvMarker = struct {
+    previous: ?[:0]u16,
+
+    fn set() !ChildEnvMarker {
+        const previous = try readEnv(nested_agent_env_name);
+        if (c.SetEnvironmentVariableW(nested_agent_env_name, nested_agent_env_value) == 0) {
+            if (previous) |value| std.heap.c_allocator.free(value);
+            return error.SetEnvironmentVariableFailed;
+        }
+        return .{ .previous = previous };
+    }
+
+    fn restore(self: ChildEnvMarker) void {
+        if (self.previous) |value| {
+            defer std.heap.c_allocator.free(value);
+            _ = c.SetEnvironmentVariableW(nested_agent_env_name, value.ptr);
+        } else {
+            _ = c.SetEnvironmentVariableW(nested_agent_env_name, null);
+        }
+    }
+};
+
+fn readEnv(name: [*:0]const u16) !?[:0]u16 {
+    const needed = c.GetEnvironmentVariableW(name, null, 0);
+    if (needed == 0) {
+        if (c.GetLastError() == c.ERROR_ENVVAR_NOT_FOUND) return null;
+        return error.GetEnvironmentVariableFailed;
+    }
+
+    const buffer = try std.heap.c_allocator.allocSentinel(u16, needed - 1, 0);
+    errdefer std.heap.c_allocator.free(buffer);
+    const written = c.GetEnvironmentVariableW(name, buffer.ptr, needed);
+    if (written == 0 or written >= needed) return error.GetEnvironmentVariableFailed;
+    return buffer;
+}
 
 const PipePair = struct {
     read_handle: c.HANDLE,
