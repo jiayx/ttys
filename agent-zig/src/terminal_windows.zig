@@ -4,30 +4,49 @@ const c = @cImport({
 });
 
 pub const RawTerminal = struct {
-    handle: c.HANDLE,
-    mode: c.DWORD,
+    input_handle: c.HANDLE,
+    input_mode: c.DWORD,
+    output_handle: c.HANDLE,
+    output_mode: c.DWORD,
+    output_mode_active: bool,
 
     pub fn enter() !RawTerminal {
-        const handle = c.GetStdHandle(c.STD_INPUT_HANDLE);
-        if (handle == null or handle == c.INVALID_HANDLE_VALUE) return error.TerminalState;
+        const input_handle = c.GetStdHandle(c.STD_INPUT_HANDLE);
+        if (input_handle == null or input_handle == c.INVALID_HANDLE_VALUE) return error.TerminalState;
 
-        var mode: c.DWORD = 0;
-        if (c.GetConsoleMode(handle, &mode) == 0) return error.TerminalState;
+        var input_mode: c.DWORD = 0;
+        if (c.GetConsoleMode(input_handle, &input_mode) == 0) return error.TerminalState;
 
-        var raw_mode = mode;
+        var raw_mode = input_mode;
         raw_mode &= ~@as(c.DWORD, c.ENABLE_ECHO_INPUT);
         raw_mode &= ~@as(c.DWORD, c.ENABLE_LINE_INPUT);
         raw_mode &= ~@as(c.DWORD, c.ENABLE_PROCESSED_INPUT);
-        if (c.SetConsoleMode(handle, raw_mode) == 0) return error.TerminalState;
+        if (c.SetConsoleMode(input_handle, raw_mode) == 0) return error.TerminalState;
+
+        const output_handle = c.GetStdHandle(c.STD_OUTPUT_HANDLE);
+        var output_mode: c.DWORD = 0;
+        var output_mode_active = false;
+        if (output_handle != null and output_handle != c.INVALID_HANDLE_VALUE and c.GetConsoleMode(output_handle, &output_mode) != 0) {
+            const vt_mode = output_mode |
+                @as(c.DWORD, c.ENABLE_PROCESSED_OUTPUT) |
+                @as(c.DWORD, c.ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            output_mode_active = c.SetConsoleMode(output_handle, vt_mode) != 0;
+        }
 
         return .{
-            .handle = handle,
-            .mode = mode,
+            .input_handle = input_handle,
+            .input_mode = input_mode,
+            .output_handle = output_handle,
+            .output_mode = output_mode,
+            .output_mode_active = output_mode_active,
         };
     }
 
     pub fn leave(self: *const RawTerminal) void {
-        _ = c.SetConsoleMode(self.handle, self.mode);
+        _ = c.SetConsoleMode(self.input_handle, self.input_mode);
+        if (self.output_mode_active) {
+            _ = c.SetConsoleMode(self.output_handle, self.output_mode);
+        }
     }
 };
 

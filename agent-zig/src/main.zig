@@ -29,6 +29,7 @@ const Mutex = sync.Mutex;
 const nested_agent_env = "TTYS_AGENT_ACTIVE";
 const remote_output_flush_ns = 1 * std.time.ns_per_ms;
 const remote_output_max_batch = 16 * 1024;
+const windows_utf8_code_page = 65001;
 
 const Config = struct {
     server_url: []const u8 = "http://localhost:5173",
@@ -495,6 +496,7 @@ const ThreadContext = struct {
 pub fn main(init: std.process.Init) !void {
     try transport_mod.globalInit();
     defer transport_mod.globalDeinit();
+    configureWindowsConsoleEncoding();
 
     if (init.environ_map.contains(nested_agent_env)) {
         try writeStderrAll("ttys-agent is already active in this terminal session.\n");
@@ -604,13 +606,19 @@ fn outputFlusherMain(ctx: *ThreadContext) void {
 
 fn websocketMain(ctx: *ThreadContext) void {
     var delay_ms: u64 = 250;
+    var logged_failure = false;
     while (!ctx.state.isDone()) {
-        var ws = WebSocketClient.connect(ctx.allocator, ctx.io, ctx.host_websocket_url) catch {
+        var ws = WebSocketClient.connect(ctx.allocator, ctx.io, ctx.host_websocket_url) catch |err| {
+            if (!logged_failure) {
+                printWebSocketConnectFailed(err) catch {};
+                logged_failure = true;
+            }
             sleepMillis(delay_ms);
             delay_ms = @min(delay_ms * 2, 5000);
             continue;
         };
         delay_ms = 250;
+        logged_failure = false;
         ctx.ws.setConnected(&ws);
 
         readWebSocketLoop(ctx, &ws);
@@ -1041,12 +1049,22 @@ fn sleepMillis(ms: u64) void {
     _ = posix_c.usleep(@intCast(ms * 1000));
 }
 
+fn configureWindowsConsoleEncoding() void {
+    if (builtin.os.tag != .windows) return;
+    _ = win_c.SetConsoleCP(windows_utf8_code_page);
+    _ = win_c.SetConsoleOutputCP(windows_utf8_code_page);
+}
+
 fn printSessionStarted(viewer_url: []const u8) !void {
     try writeStderrAll("ttys-agent: shared shell is active.\n");
     try writeStderrAll("Share URL: ");
     try writeStderrAll(viewer_url);
     try writeStderrAll("\n");
-    try writeStderrAll("Exit the shared shell with Ctrl-D or 'exit'.\n\n");
+    if (builtin.os.tag == .windows) {
+        try writeStderrAll("Exit the shared shell with 'exit'.\n\n");
+    } else {
+        try writeStderrAll("Exit the shared shell with Ctrl-D or 'exit'.\n\n");
+    }
 }
 
 fn printSessionEnded(failed: bool) !void {
@@ -1055,6 +1073,12 @@ fn printSessionEnded(failed: bool) !void {
     } else {
         try writeStderrAll("\nttys-agent: shared shell ended. Remote access is closed.\n");
     }
+}
+
+fn printWebSocketConnectFailed(err: anyerror) !void {
+    try writeStderrAll("\r\nttys-agent: server connection failed: ");
+    try writeStderrAll(@errorName(err));
+    try writeStderrAll(". Retrying...\r\n");
 }
 
 fn writeStdoutAll(bytes: []const u8) !void {

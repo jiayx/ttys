@@ -64,8 +64,7 @@ pub const WebSocketClient = struct {
         if (request == null) return error.WinHttpOpenRequestFailed;
         defer _ = c.WinHttpCloseHandle(request);
 
-        var enable_ws: c.DWORD = 0;
-        if (c.WinHttpSetOption(request, c.WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, &enable_ws, @sizeOf(c.DWORD)) == 0) {
+        if (c.WinHttpSetOption(request, c.WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, null, 0) == 0) {
             return error.WinHttpSetOptionFailed;
         }
 
@@ -138,9 +137,7 @@ pub const WebSocketClient = struct {
             var read_len: c.DWORD = 0;
             var buffer_type: c.WINHTTP_WEB_SOCKET_BUFFER_TYPE = c.WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
 
-            self.lock.lock();
             const rc = c.WinHttpWebSocketReceive(self.websocket, &buf, buf.len, &read_len, &buffer_type);
-            self.lock.unlock();
 
             if (rc == c.ERROR_IO_PENDING or rc == c.WSAEWOULDBLOCK) {
                 if (result.items.len > 0) break;

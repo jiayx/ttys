@@ -148,12 +148,12 @@ if ($ActualChecksum -ne $ExpectedChecksum) {
   exit 1
 }
 
+$AgentArgs = @("-server", $Server)
 if ($Session) {
-  & $AgentPath -server $Server -session $Session
-  exit $LASTEXITCODE
+  $AgentArgs += @("-session", $Session)
 }
 
-& $AgentPath -server $Server
-exit $LASTEXITCODE
+$AgentProcess = Start-Process -FilePath $AgentPath -ArgumentList $AgentArgs -NoNewWindow -Wait -PassThru
+exit $AgentProcess.ExitCode
 `;
 }
