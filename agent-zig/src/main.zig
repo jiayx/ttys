@@ -442,8 +442,7 @@ pub fn main(init: std.process.Init) !void {
 
     var pty = try PTY.spawn(shell);
 
-    std.debug.print("Share URL: {s}\n", .{connect_info.viewer_url});
-    std.debug.print("Exit this shared shell with Ctrl-D or 'exit'.\n", .{});
+    try printSessionStarted(connect_info.viewer_url);
 
     const raw_terminal = try RawTerminal.enter();
     defer raw_terminal.leave();
@@ -486,10 +485,13 @@ pub fn main(init: std.process.Init) !void {
     ws.closeCurrent();
 
     if (err) |message| {
+        try printSessionEnded(true);
         try writeStderrAll(message);
         try writeStderrAll("\n");
         return error.RunFailed;
     }
+
+    try printSessionEnded(false);
 }
 
 fn ptyReaderMain(ctx: *ThreadContext) void {
@@ -951,6 +953,22 @@ fn sleepMillis(ms: u64) void {
         return;
     }
     _ = posix_c.usleep(@intCast(ms * 1000));
+}
+
+fn printSessionStarted(viewer_url: []const u8) !void {
+    try writeStderrAll("ttys-agent: shared shell is active.\n");
+    try writeStderrAll("Share URL: ");
+    try writeStderrAll(viewer_url);
+    try writeStderrAll("\n");
+    try writeStderrAll("Exit the shared shell with Ctrl-D or 'exit'.\n\n");
+}
+
+fn printSessionEnded(failed: bool) !void {
+    if (failed) {
+        try writeStderrAll("\nttys-agent: shared shell ended with an error.\n");
+    } else {
+        try writeStderrAll("\nttys-agent: shared shell ended. Remote access is closed.\n");
+    }
 }
 
 fn writeStdoutAll(bytes: []const u8) !void {

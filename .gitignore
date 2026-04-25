@@ -9,3 +9,4 @@ coverage
 apps/web/public/downloads/local/
 .zig-cache/
 zig-out/
+.DS_Store
