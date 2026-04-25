@@ -28,6 +28,13 @@ export function decodeBinaryMessage(
   };
 }
 
+export function binaryMessageType(buffer: ArrayBuffer): number | null {
+  if (buffer.byteLength === 0) {
+    return null;
+  }
+  return new Uint8Array(buffer, 0, 1)[0];
+}
+
 export function encodeBinaryMessage(messageType: number, payload: Uint8Array): ArrayBuffer {
   const message = new Uint8Array(payload.length + 1);
   message[0] = messageType;

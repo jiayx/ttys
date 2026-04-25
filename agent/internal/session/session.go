@@ -24,6 +24,11 @@ import (
 
 var errSocketDisconnected = errors.New("websocket is not connected")
 
+const (
+	remoteOutputFlushDelay = time.Millisecond
+	remoteOutputMaxBatch   = 16 * 1024
+)
+
 type socketSlot struct {
 	mu     sync.Mutex
 	client *transport.Client
@@ -71,12 +76,111 @@ func (s *socketSlot) writeBinary(data []byte) error {
 	return client.WriteBinary(data)
 }
 
+func (s *socketSlot) writeBinaryFrom(messageType byte, payload []byte) error {
+	client, err := s.current()
+	if err != nil {
+		return err
+	}
+	return client.WriteBinaryFrom(messageType, payload)
+}
+
 func (s *socketSlot) writeJSON(v any) error {
 	client, err := s.current()
 	if err != nil {
 		return err
 	}
 	return client.WriteJSON(v)
+}
+
+type remoteOutputBatcher struct {
+	mu       sync.Mutex
+	socket   *socketSlot
+	pending  []byte
+	lastSend time.Time
+}
+
+func newRemoteOutputBatcher(socket *socketSlot) *remoteOutputBatcher {
+	return &remoteOutputBatcher{
+		socket:  socket,
+		pending: make([]byte, 0, remoteOutputMaxBatch),
+	}
+}
+
+func (b *remoteOutputBatcher) start(done <-chan struct{}) {
+	ticker := time.NewTicker(remoteOutputFlushDelay)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				b.flush(false)
+			case <-done:
+				b.flush(true)
+				return
+			}
+		}
+	}()
+}
+
+func (b *remoteOutputBatcher) write(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := time.Now()
+	if len(b.pending) == 0 && shouldSendRemoteOutputImmediately(b.lastSend, now) {
+		b.lastSend = now
+		_ = b.socket.writeBinaryFrom(protocol.BinaryTTYOutput, data)
+		return
+	}
+
+	if len(data) > cap(b.pending)-len(b.pending) {
+		b.flushLocked(now)
+	}
+
+	if len(data) > cap(b.pending) {
+		b.lastSend = now
+		_ = b.socket.writeBinaryFrom(protocol.BinaryTTYOutput, data)
+		return
+	}
+
+	b.pending = append(b.pending, data...)
+	if len(b.pending) == cap(b.pending) {
+		b.flushLocked(now)
+	}
+}
+
+func (b *remoteOutputBatcher) flush(force bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.pending) == 0 {
+		return
+	}
+
+	now := time.Now()
+	if !force && now.Sub(b.lastSend) < remoteOutputFlushDelay {
+		return
+	}
+
+	b.flushLocked(now)
+}
+
+func (b *remoteOutputBatcher) flushLocked(now time.Time) {
+	if len(b.pending) == 0 {
+		return
+	}
+
+	_ = b.socket.writeBinaryFrom(protocol.BinaryTTYOutput, b.pending)
+	b.pending = b.pending[:0]
+	b.lastSend = now
+}
+
+func shouldSendRemoteOutputImmediately(lastSend time.Time, now time.Time) bool {
+	return lastSend.IsZero() || now.Sub(lastSend) >= remoteOutputFlushDelay
 }
 
 type Config struct {
@@ -134,6 +238,9 @@ func Run(ctx context.Context, cfg Config) error {
 	firstSocketConnected := make(chan struct{})
 	statusCh := make(chan protocol.SessionStatusPayload, 4)
 	decisionCh := make(chan modalDecision, 2)
+	remoteOutput := newRemoteOutputBatcher(socket)
+	remoteOutput.start(done)
+	defer remoteOutput.flush(true)
 	var once sync.Once
 
 	stop := func(runErr error) {
@@ -150,7 +257,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if _, writeErr := os.Stdout.Write(data); writeErr != nil {
 			return writeErr
 		}
-		_ = socket.writeBinary(protocol.EncodeBinary(protocol.BinaryTTYOutput, data))
+		remoteOutput.write(data)
 		return nil
 	}
 

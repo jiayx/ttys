@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   BinaryMessageType,
+  binaryMessageType,
   binarySocketDataToArrayBuffer,
-  decodeBinaryMessage,
 } from "../protocol";
 
 type SessionState = "idle" | "ready" | "active" | "closed";
@@ -28,6 +28,7 @@ const DEFAULT_CONTROL_LEASE_SECONDS = 30 * 60;
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
 const HOST_DISCONNECT_GRACE_MS = 60 * 1000;
 const PENDING_REQUEST_TIMEOUT_MS = 30 * 1000;
+const REPLAY_BUFFER_MAX_BYTES = 2 * 1024 * 1024;
 
 export class TTYSession extends DurableObject {
   private host: WebSocket | null = null;
@@ -35,6 +36,7 @@ export class TTYSession extends DurableObject {
   private state: SessionState = "idle";
   private hostConnected = false;
   private buffer: ArrayBuffer[] = [];
+  private bufferBytes = 0;
   private currentControllerId: string | null = null;
   private controlLeaseExpiresAt: number | null = null;
   private pendingRequest: ControlRequest | null = null;
@@ -104,7 +106,8 @@ export class TTYSession extends DurableObject {
       });
     }
 
-    server.send(
+    this.sendSocket(
+      server,
       JSON.stringify({
         type: "session.status",
         payload: this.snapshot(server, role),
@@ -112,7 +115,9 @@ export class TTYSession extends DurableObject {
     );
     if (role === "viewer" && this.buffer.length > 0) {
       for (const chunk of this.buffer) {
-        server.send(chunk);
+        if (!this.sendSocket(server, chunk)) {
+          break;
+        }
       }
     }
     this.broadcastStatus();
@@ -212,8 +217,7 @@ export class TTYSession extends DurableObject {
         return;
       }
 
-      const binary = decodeBinaryMessage(buffer);
-      if (binary?.messageType !== BinaryMessageType.ttyOutput) {
+      if (binaryMessageType(buffer) !== BinaryMessageType.ttyOutput) {
         socket.close(1003, "invalid host binary message");
         return;
       }
@@ -221,7 +225,7 @@ export class TTYSession extends DurableObject {
       this.pushBuffer(buffer);
 
       for (const viewer of this.viewers.values()) {
-        viewer.socket.send(buffer);
+        this.sendViewer(viewer, buffer);
       }
       return;
     }
@@ -233,14 +237,13 @@ export class TTYSession extends DurableObject {
         return;
       }
 
-      const binary = decodeBinaryMessage(buffer);
-      if (binary?.messageType !== BinaryMessageType.stdin) {
+      if (binaryMessageType(buffer) !== BinaryMessageType.stdin) {
         socket.close(1003, "invalid viewer binary message");
         return;
       }
 
       if (this.canWrite(socket)) {
-        this.host?.send(buffer);
+        this.sendHost(buffer);
       }
       return;
     }
@@ -264,16 +267,7 @@ export class TTYSession extends DurableObject {
       return;
     }
 
-    const viewer = this.viewers.get(socket);
-    if (viewer?.id === this.currentControllerId) {
-      this.currentControllerId = null;
-      this.controlLeaseExpiresAt = null;
-    }
-    if (viewer?.id === this.pendingRequest?.viewerId) {
-      this.pendingRequest = null;
-      this.pendingRequestExpiresAt = null;
-    }
-    this.viewers.delete(socket);
+    this.removeViewer(socket);
     this.broadcastStatus();
     await this.scheduleNextAlarm();
   }
@@ -303,7 +297,7 @@ export class TTYSession extends DurableObject {
     };
     this.pendingRequestExpiresAt = Date.now() + PENDING_REQUEST_TIMEOUT_MS;
 
-    this.host?.send(
+    this.sendHost(
       JSON.stringify({
         type: "control.request",
         payload: this.pendingRequest,
@@ -362,9 +356,13 @@ export class TTYSession extends DurableObject {
   }
 
   private pushBuffer(chunk: ArrayBuffer) {
-    this.buffer.push(chunk.slice(0));
-    if (this.buffer.length > 64) {
-      this.buffer.shift();
+    const copy = chunk.slice(0);
+    this.buffer.push(copy);
+    this.bufferBytes += copy.byteLength;
+
+    while (this.bufferBytes > REPLAY_BUFFER_MAX_BYTES && this.buffer.length > 0) {
+      const removed = this.buffer.shift();
+      this.bufferBytes -= removed?.byteLength ?? 0;
     }
   }
 
@@ -397,7 +395,7 @@ export class TTYSession extends DurableObject {
   private broadcastStatus() {
     this.advanceState();
     if (this.host) {
-      this.host.send(
+      this.sendHost(
         JSON.stringify({
           type: "session.status",
           payload: this.snapshot(this.host, "host"),
@@ -406,13 +404,62 @@ export class TTYSession extends DurableObject {
     }
 
     for (const viewer of this.viewers.values()) {
-      viewer.socket.send(
+      this.sendViewer(
+        viewer,
         JSON.stringify({
           type: "session.status",
           payload: this.snapshot(viewer.socket, "viewer"),
         }),
       );
     }
+  }
+
+  private sendHost(message: string | ArrayBuffer) {
+    if (!this.host) {
+      return false;
+    }
+
+    if (this.sendSocket(this.host, message)) {
+      return true;
+    }
+
+    this.clearHost();
+    return false;
+  }
+
+  private sendViewer(viewer: ViewerInfo, message: string | ArrayBuffer) {
+    if (this.sendSocket(viewer.socket, message)) {
+      return true;
+    }
+
+    this.removeViewer(viewer.socket);
+    return false;
+  }
+
+  private sendSocket(socket: WebSocket, message: string | ArrayBuffer) {
+    if (socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    try {
+      socket.send(message);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private removeViewer(socket: WebSocket) {
+    const viewer = this.viewers.get(socket);
+    if (viewer?.id === this.currentControllerId) {
+      this.currentControllerId = null;
+      this.controlLeaseExpiresAt = null;
+    }
+    if (viewer?.id === this.pendingRequest?.viewerId) {
+      this.pendingRequest = null;
+      this.pendingRequestExpiresAt = null;
+    }
+    this.viewers.delete(socket);
   }
 
   private advanceState() {

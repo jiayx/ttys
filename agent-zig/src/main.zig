@@ -9,6 +9,7 @@ const transport_mod = @import("transport.zig");
 const posix_c = if (builtin.os.tag == .windows) struct {} else @cImport({
     @cInclude("errno.h");
     @cInclude("poll.h");
+    @cInclude("time.h");
     @cInclude("unistd.h");
 });
 
@@ -26,6 +27,8 @@ const getTerminalSize = terminal_mod.getTerminalSize;
 const WebSocketClient = transport_mod.WebSocketClient;
 const Mutex = sync.Mutex;
 const nested_agent_env = "TTYS_AGENT_ACTIVE";
+const remote_output_flush_ns = 1 * std.time.ns_per_ms;
+const remote_output_max_batch = 16 * 1024;
 
 const Config = struct {
     server_url: []const u8 = "http://localhost:5173",
@@ -168,7 +171,11 @@ const WebSocketSlot = struct {
 
 const SharedOutput = struct {
     stdout_lock: Mutex = .{},
+    remote_lock: Mutex = .{},
     websocket: *WebSocketSlot,
+    pending_remote: [remote_output_max_batch]u8 = undefined,
+    pending_remote_len: usize = 0,
+    last_remote_send_ns: i128 = 0,
 
     fn forward(self: *SharedOutput, bytes: []const u8) !void {
         if (bytes.len == 0) return;
@@ -179,7 +186,7 @@ const SharedOutput = struct {
             try writeStdoutAll(bytes);
         }
 
-        self.websocket.writeBinaryMessage(.tty_output, bytes) catch {};
+        self.forwardRemote(bytes);
     }
 
     fn beep(self: *SharedOutput) !void {
@@ -193,7 +200,71 @@ const SharedOutput = struct {
         defer self.stdout_lock.unlock();
         try writeStdoutAll(text);
     }
+
+    fn forwardRemote(self: *SharedOutput, bytes: []const u8) void {
+        self.remote_lock.lock();
+        defer self.remote_lock.unlock();
+
+        const now = monotonicNanoTimestamp();
+        if (self.pending_remote_len == 0 and shouldSendImmediately(self.last_remote_send_ns, now)) {
+            self.last_remote_send_ns = now;
+            self.websocket.writeBinaryMessage(.tty_output, bytes) catch {};
+            return;
+        }
+
+        if (bytes.len > self.pending_remote.len - self.pending_remote_len) {
+            self.flushRemoteLocked(now);
+        }
+
+        if (bytes.len > self.pending_remote.len) {
+            self.last_remote_send_ns = now;
+            self.websocket.writeBinaryMessage(.tty_output, bytes) catch {};
+            return;
+        }
+
+        @memcpy(self.pending_remote[self.pending_remote_len..][0..bytes.len], bytes);
+        self.pending_remote_len += bytes.len;
+
+        if (self.pending_remote_len == self.pending_remote.len) {
+            self.flushRemoteLocked(now);
+        }
+    }
+
+    fn flushRemoteDue(self: *SharedOutput, force: bool) void {
+        self.remote_lock.lock();
+        defer self.remote_lock.unlock();
+
+        if (self.pending_remote_len == 0) return;
+
+        const now = monotonicNanoTimestamp();
+        if (!force and now - self.last_remote_send_ns < remote_output_flush_ns) return;
+
+        self.flushRemoteLocked(now);
+    }
+
+    fn flushRemoteLocked(self: *SharedOutput, now: i128) void {
+        if (self.pending_remote_len == 0) return;
+
+        const bytes = self.pending_remote[0..self.pending_remote_len];
+        self.pending_remote_len = 0;
+        self.last_remote_send_ns = now;
+        self.websocket.writeBinaryMessage(.tty_output, bytes) catch {};
+    }
 };
+
+fn shouldSendImmediately(last_send_ns: i128, now: i128) bool {
+    return last_send_ns == 0 or now - last_send_ns >= remote_output_flush_ns;
+}
+
+fn monotonicNanoTimestamp() i128 {
+    if (builtin.os.tag == .windows) {
+        return @as(i128, win_c.GetTickCount64()) * std.time.ns_per_ms;
+    }
+
+    var ts: posix_c.timespec = undefined;
+    if (posix_c.clock_gettime(posix_c.CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return @as(i128, ts.tv_sec) * std.time.ns_per_s + @as(i128, ts.tv_nsec);
+}
 
 const ApprovalModal = struct {
     allocator: Allocator,
@@ -476,12 +547,15 @@ pub fn main(init: std.process.Init) !void {
     websocket_reader_thread.detach();
     const stdin_thread = try std.Thread.spawn(.{}, stdinMain, .{&context});
     stdin_thread.detach();
+    const output_flusher_thread = try std.Thread.spawn(.{}, outputFlusherMain, .{&context});
+    output_flusher_thread.detach();
     const resize_thread = try std.Thread.spawn(.{}, resizeMain, .{&context});
     resize_thread.detach();
     const child_wait_thread = try std.Thread.spawn(.{}, childWaitMain, .{&context});
     child_wait_thread.detach();
 
     const err = state.wait();
+    output.flushRemoteDue(true);
     ws.closeCurrent();
 
     if (err) |message| {
@@ -505,6 +579,7 @@ fn ptyReaderMain(ctx: *ThreadContext) void {
             },
         };
         if (n == 0) {
+            ctx.output.flushRemoteDue(true);
             ctx.state.finishOk();
             return;
         }
@@ -514,6 +589,14 @@ fn ptyReaderMain(ctx: *ThreadContext) void {
             return;
         };
     }
+}
+
+fn outputFlusherMain(ctx: *ThreadContext) void {
+    while (!ctx.state.isDone()) {
+        sleepMillis(1);
+        ctx.output.flushRemoteDue(false);
+    }
+    ctx.output.flushRemoteDue(true);
 }
 
 fn websocketMain(ctx: *ThreadContext) void {

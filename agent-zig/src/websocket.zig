@@ -87,12 +87,17 @@ pub const Codec = struct {
 };
 
 pub fn writeClientFrame(writer: *std.Io.Writer, kind: MessageKind, payload: []const u8, mask_key: [4]u8) !void {
-    try writeFrame(writer, kind, payload, mask_key);
+    try writeFrame(writer, kind, &.{payload}, mask_key);
 }
 
-fn writeFrame(writer: *std.Io.Writer, kind: MessageKind, payload: []const u8, mask_key: [4]u8) !void {
+pub fn writeClientFrameParts(writer: *std.Io.Writer, kind: MessageKind, parts: []const []const u8, mask_key: [4]u8) !void {
+    try writeFrame(writer, kind, parts, mask_key);
+}
+
+fn writeFrame(writer: *std.Io.Writer, kind: MessageKind, parts: []const []const u8, mask_key: [4]u8) !void {
     const opcode = opcodeForMessage(kind);
-    if (isControl(opcode) and payload.len > 125) return error.ControlFrameTooLarge;
+    const payload_len = totalPayloadLen(parts);
+    if (isControl(opcode) and payload_len > 125) return error.ControlFrameTooLarge;
 
     var header: [14]u8 = undefined;
     var index: usize = 0;
@@ -100,23 +105,23 @@ fn writeFrame(writer: *std.Io.Writer, kind: MessageKind, payload: []const u8, ma
     header[index] = 0x80 | @as(u8, @intFromEnum(opcode));
     index += 1;
 
-    switch (payload.len) {
+    switch (payload_len) {
         0...125 => {
-            header[index] = 0x80 | @as(u8, @intCast(payload.len));
+            header[index] = 0x80 | @as(u8, @intCast(payload_len));
             index += 1;
         },
         126...0xffff => {
             if (isControl(opcode)) return error.ControlFrameTooLarge;
             header[index] = 0x80 | 126;
             index += 1;
-            std.mem.writeInt(u16, header[index..][0..2], @intCast(payload.len), .big);
+            std.mem.writeInt(u16, header[index..][0..2], @intCast(payload_len), .big);
             index += 2;
         },
         else => {
             if (isControl(opcode)) return error.ControlFrameTooLarge;
             header[index] = 0x80 | 127;
             index += 1;
-            std.mem.writeInt(u64, header[index..][0..8], payload.len, .big);
+            std.mem.writeInt(u64, header[index..][0..8], payload_len, .big);
             index += 8;
         },
     }
@@ -126,16 +131,26 @@ fn writeFrame(writer: *std.Io.Writer, kind: MessageKind, payload: []const u8, ma
 
     try writer.writeAll(header[0..index]);
 
-    var offset: usize = 0;
+    var payload_offset: usize = 0;
     var chunk: [4096]u8 = undefined;
-    while (offset < payload.len) {
-        const chunk_len = @min(chunk.len, payload.len - offset);
-        for (payload[offset .. offset + chunk_len], 0..) |byte, chunk_index| {
-            chunk[chunk_index] = byte ^ mask_key[(offset + chunk_index) % mask_key.len];
+    for (parts) |part| {
+        var part_offset: usize = 0;
+        while (part_offset < part.len) {
+            const chunk_len = @min(chunk.len, part.len - part_offset);
+            for (part[part_offset .. part_offset + chunk_len], 0..) |byte, chunk_index| {
+                chunk[chunk_index] = byte ^ mask_key[(payload_offset + chunk_index) % mask_key.len];
+            }
+            try writer.writeAll(chunk[0..chunk_len]);
+            part_offset += chunk_len;
+            payload_offset += chunk_len;
         }
-        try writer.writeAll(chunk[0..chunk_len]);
-        offset += chunk_len;
     }
+}
+
+fn totalPayloadLen(parts: []const []const u8) usize {
+    var total: usize = 0;
+    for (parts) |part| total += part.len;
+    return total;
 }
 
 pub fn acceptKey(key_b64: []const u8) [std.base64.standard.Encoder.calcSize(std.crypto.hash.Sha1.digest_length)]u8 {

@@ -84,9 +84,8 @@ pub const WebSocketClient = struct {
     }
 
     pub fn writeBinaryMessage(self: *WebSocketClient, kind: BinaryType, bytes: []const u8) !void {
-        const wrapped = try transport_message.wrapBinary(self.client.allocator, kind, bytes);
-        defer self.client.allocator.free(wrapped);
-        try self.writeMessage(wrapped, .binary);
+        const message_type = [_]u8{transport_message.binaryTypeByte(kind)};
+        try self.writeMessageParts(&.{ &message_type, bytes }, .binary);
     }
 
     pub fn writeJSON(self: *WebSocketClient, text: []const u8) !void {
@@ -120,6 +119,10 @@ pub const WebSocketClient = struct {
     }
 
     fn writeMessage(self: *WebSocketClient, data: []const u8, opcode: websocket.MessageKind) !void {
+        try self.writeMessageParts(&.{data}, opcode);
+    }
+
+    fn writeMessageParts(self: *WebSocketClient, parts: []const []const u8, opcode: websocket.MessageKind) !void {
         self.write_lock.lock();
         defer self.write_lock.unlock();
 
@@ -127,7 +130,7 @@ pub const WebSocketClient = struct {
         self.io.random(&mask_key);
 
         const writer = self.connection.writer();
-        try websocket.writeClientFrame(writer, opcode, data, mask_key);
+        try websocket.writeClientFrameParts(writer, opcode, parts, mask_key);
         try self.connection.flush();
     }
 };
