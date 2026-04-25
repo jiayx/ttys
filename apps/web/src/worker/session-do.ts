@@ -15,6 +15,14 @@ type ControlRequest = {
   viewerId: string;
   leaseSeconds: number;
 };
+type SocketAttachment =
+  | {
+      role: "host";
+    }
+  | {
+      role: "viewer";
+      viewerId: string;
+    };
 
 const DEFAULT_CONTROL_LEASE_SECONDS = 30 * 60;
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
@@ -34,6 +42,11 @@ export class TTYSession extends DurableObject {
   private createdAt = Date.now();
   private sessionExpiresAt = this.createdAt + SESSION_TTL_MS;
   private hostDisconnectDeadline: number | null = null;
+
+  constructor(ctx: DurableObjectState, env: unknown) {
+    super(ctx, env);
+    this.restoreSockets();
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -73,23 +86,20 @@ export class TTYSession extends DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    server.accept();
-    server.addEventListener("message", (event) => {
-      void this.handleMessage(role, server, event.data);
-    });
-    server.addEventListener("close", () => {
-      void this.handleClose(role, server);
-    });
-
     if (role === "host") {
       this.host?.close(1012, "replaced by new host");
+      server.serializeAttachment({ role });
+      this.ctx.acceptWebSocket(server, [role]);
       this.host = server;
       this.hostConnected = true;
       this.hostDisconnectDeadline = null;
       this.state = "active";
     } else {
+      const viewerId = crypto.randomUUID().slice(0, 8);
+      server.serializeAttachment({ role, viewerId });
+      this.ctx.acceptWebSocket(server, [role]);
       this.viewers.set(server, {
-        id: crypto.randomUUID().slice(0, 8),
+        id: viewerId,
         socket: server,
       });
     }
@@ -112,6 +122,60 @@ export class TTYSession extends DurableObject {
       status: 101,
       webSocket: client,
     });
+  }
+
+  async webSocketMessage(socket: WebSocket, data: string | ArrayBuffer) {
+    const attachment = socket.deserializeAttachment() as SocketAttachment | null;
+    if (!attachment) {
+      socket.close(1003, "missing socket attachment");
+      return;
+    }
+
+    await this.handleMessage(attachment.role, socket, data);
+  }
+
+  async webSocketClose(socket: WebSocket) {
+    const attachment = socket.deserializeAttachment() as SocketAttachment | null;
+    if (!attachment) {
+      return;
+    }
+
+    await this.handleClose(attachment.role, socket);
+  }
+
+  async webSocketError(socket: WebSocket) {
+    await this.webSocketClose(socket);
+  }
+
+  private restoreSockets() {
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as SocketAttachment | null;
+      if (!attachment) {
+        socket.close(1003, "missing socket attachment");
+        continue;
+      }
+
+      if (attachment.role === "host") {
+        if (this.host && this.host !== socket) {
+          socket.close(1012, "replaced by newer host");
+          continue;
+        }
+        this.host = socket;
+        this.hostConnected = true;
+        this.hostDisconnectDeadline = null;
+        this.state = "active";
+        continue;
+      }
+
+      this.viewers.set(socket, {
+        id: attachment.viewerId,
+        socket,
+      });
+    }
+
+    if (!this.hostConnected && this.viewers.size > 0 && this.state === "idle") {
+      this.state = "ready";
+    }
   }
 
   private async handleMessage(
@@ -190,16 +254,12 @@ export class TTYSession extends DurableObject {
   }
 
   private async handleClose(role: SessionRole, socket: WebSocket) {
-    if (role === "host" && this.host === socket) {
-      this.host = null;
-      this.hostConnected = false;
-      this.hostDisconnectDeadline = Date.now() + HOST_DISCONNECT_GRACE_MS;
-      this.currentControllerId = null;
-      this.controlLeaseExpiresAt = null;
-      this.pendingRequest = null;
-      this.pendingRequestExpiresAt = null;
-      this.state = "ready";
-      this.broadcastStatus();
+    if (role === "host") {
+      if (this.host !== socket) {
+        return;
+      }
+
+      this.clearHost();
       await this.scheduleNextAlarm();
       return;
     }
@@ -216,6 +276,18 @@ export class TTYSession extends DurableObject {
     this.viewers.delete(socket);
     this.broadcastStatus();
     await this.scheduleNextAlarm();
+  }
+
+  private clearHost() {
+    this.host = null;
+    this.hostConnected = false;
+    this.hostDisconnectDeadline = Date.now() + HOST_DISCONNECT_GRACE_MS;
+    this.currentControllerId = null;
+    this.controlLeaseExpiresAt = null;
+    this.pendingRequest = null;
+    this.pendingRequestExpiresAt = null;
+    this.state = "ready";
+    this.broadcastStatus();
   }
 
   private handleControlRequest(socket: WebSocket, payload: unknown) {
