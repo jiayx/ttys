@@ -725,7 +725,7 @@ function readSessionId() {
     return null;
   }
 
-  const match = window.location.pathname.match(/^\/s\/([^/]+)$/);
+  const match = window.location.pathname.match(/^\/s\/([23456789abcdefghjkmnpqrstuvwxyz]{3}-[23456789abcdefghjkmnpqrstuvwxyz]{3})$/);
   return match?.[1] ?? null;
 }
 

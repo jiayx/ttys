@@ -25,7 +25,9 @@ type SocketAttachment =
     };
 
 const DEFAULT_CONTROL_LEASE_SECONDS = 30 * 60;
-const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+const SESSION_IDLE_TTL_MS = 2 * 60 * 60 * 1000;
+const SESSION_MAX_TTL_MS = 24 * 60 * 60 * 1000;
+const SESSION_RENEW_THRESHOLD_MS = 30 * 60 * 1000;
 const HOST_DISCONNECT_GRACE_MS = 60 * 1000;
 const PENDING_REQUEST_TIMEOUT_MS = 30 * 1000;
 const REPLAY_BUFFER_MAX_BYTES = 2 * 1024 * 1024;
@@ -42,7 +44,8 @@ export class TTYSession extends DurableObject {
   private pendingRequest: ControlRequest | null = null;
   private pendingRequestExpiresAt: number | null = null;
   private createdAt = Date.now();
-  private sessionExpiresAt = this.createdAt + SESSION_TTL_MS;
+  private maxExpiresAt = this.createdAt + SESSION_MAX_TTL_MS;
+  private sessionExpiresAt = this.createdAt + SESSION_IDLE_TTL_MS;
   private hostDisconnectDeadline: number | null = null;
 
   constructor(ctx: DurableObjectState, env: unknown) {
@@ -54,9 +57,13 @@ export class TTYSession extends DurableObject {
     const url = new URL(request.url);
 
     if (url.pathname === "/init" && request.method === "POST") {
+      if (this.state !== "idle" && this.state !== "closed") {
+        return new Response("session id already exists", { status: 409 });
+      }
       this.state = "ready";
       this.createdAt = Date.now();
-      this.sessionExpiresAt = this.createdAt + SESSION_TTL_MS;
+      this.maxExpiresAt = this.createdAt + SESSION_MAX_TTL_MS;
+      this.sessionExpiresAt = Math.min(this.createdAt + SESSION_IDLE_TTL_MS, this.maxExpiresAt);
       await this.scheduleNextAlarm();
       return Response.json(this.snapshot());
     }
@@ -87,6 +94,7 @@ export class TTYSession extends DurableObject {
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
+    void this.touchSession();
 
     if (role === "host") {
       this.host?.close(1012, "replaced by new host");
@@ -195,17 +203,17 @@ export class TTYSession extends DurableObject {
         const frame = parseEnvelope(data);
         if (frame?.type === "control.approve") {
           this.handleControlApprove(frame.payload);
-          await this.scheduleNextAlarm();
+          await this.touchSession();
           return;
         }
         if (frame?.type === "control.reject") {
           this.handleControlReject(frame.payload);
-          await this.scheduleNextAlarm();
+          await this.touchSession();
           return;
         }
         if (frame?.type === "control.revoke") {
           this.handleControlRevoke();
-          await this.scheduleNextAlarm();
+          await this.touchSession();
           return;
         }
         return;
@@ -222,6 +230,7 @@ export class TTYSession extends DurableObject {
         return;
       }
 
+      void this.touchSession();
       this.pushBuffer(buffer);
 
       for (const viewer of this.viewers.values()) {
@@ -243,6 +252,7 @@ export class TTYSession extends DurableObject {
       }
 
       if (this.canWrite(socket)) {
+        void this.touchSession();
         this.sendHost(buffer);
       }
       return;
@@ -251,7 +261,7 @@ export class TTYSession extends DurableObject {
     const frame = parseEnvelope(data);
     if (frame?.type === "control.request") {
       this.handleControlRequest(socket, frame.payload);
-      await this.scheduleNextAlarm();
+      await this.touchSession();
       return;
     }
   }
@@ -519,6 +529,20 @@ export class TTYSession extends DurableObject {
       viewer.socket.close(1000, reason);
     }
     this.viewers.clear();
+  }
+
+  private async touchSession() {
+    if (this.state === "closed") return;
+
+    const now = Date.now();
+    const remaining = this.sessionExpiresAt - now;
+    if (remaining > SESSION_RENEW_THRESHOLD_MS) return;
+
+    const nextExpiresAt = Math.min(now + SESSION_IDLE_TTL_MS, this.maxExpiresAt);
+    if (nextExpiresAt <= this.sessionExpiresAt) return;
+
+    this.sessionExpiresAt = nextExpiresAt;
+    await this.scheduleNextAlarm();
   }
 
   private async scheduleNextAlarm() {

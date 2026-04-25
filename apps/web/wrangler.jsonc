@@ -6,7 +6,8 @@
   "assets": {
     "binding": "ASSETS",
     "directory": "./dist/client",
-    "not_found_handling": "single-page-application"
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/start", "/start.ps1", "/downloads/release/*"]
   },
   "vars": {
     "BOOTSTRAP_GITHUB_REPOSITORY": "jiayx/ttys"
