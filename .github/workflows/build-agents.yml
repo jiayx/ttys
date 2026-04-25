@@ -106,31 +106,26 @@ jobs:
           - id: darwin-amd64
             runner: macos-15-intel
             target: ""
-            linux_transport: ""
             ext: ""
             asset: ttys-agent-zig-darwin-amd64
           - id: darwin-arm64
             runner: macos-15
             target: ""
-            linux_transport: ""
             ext: ""
             asset: ttys-agent-zig-darwin-arm64
           - id: linux-amd64
             runner: ubuntu-24.04
             target: x86_64-linux-gnu
-            linux_transport: portable
             ext: ""
             asset: ttys-agent-zig-linux-amd64
           - id: linux-arm64
             runner: ubuntu-24.04
             target: aarch64-linux-gnu
-            linux_transport: portable
             ext: ""
             asset: ttys-agent-zig-linux-arm64
           - id: windows-amd64
             runner: windows-2025
             target: x86_64-windows-gnu
-            linux_transport: ""
             ext: ".exe"
             asset: ttys-agent-zig-windows-amd64.exe
 
@@ -163,10 +158,6 @@ jobs:
 
           if [[ -n "${{ matrix.target }}" ]]; then
             args=("-Dtarget=${{ matrix.target }}" "${args[@]}")
-          fi
-
-          if [[ -n "${{ matrix.linux_transport }}" ]]; then
-            args+=("-Dlinux_transport=${{ matrix.linux_transport }}")
           fi
 
           export ZIG_GLOBAL_CACHE_DIR="${PWD}/.zig-cache"
