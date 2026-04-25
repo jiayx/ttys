@@ -74,15 +74,21 @@ pub const PTY = struct {
         c.ClosePseudoConsole(self.console);
     }
 
-    pub fn read(self: *const PTY, buf: []u8) isize {
+    pub fn read(self: *const PTY, buf: []u8) !usize {
         var read_count: c.DWORD = 0;
-        if (c.ReadFile(self.output, buf.ptr, @intCast(buf.len), &read_count, null) == 0) return -1;
+        if (c.ReadFile(self.output, buf.ptr, @intCast(buf.len), &read_count, null) == 0) {
+            if (c.GetLastError() == c.ERROR_OPERATION_ABORTED) return error.Interrupted;
+            return error.PTYReadFailed;
+        }
         return @intCast(read_count);
     }
 
-    pub fn write(self: *const PTY, buf: []const u8) isize {
+    pub fn write(self: *const PTY, buf: []const u8) !usize {
         var written: c.DWORD = 0;
-        if (c.WriteFile(self.input, buf.ptr, @intCast(buf.len), &written, null) == 0) return -1;
+        if (c.WriteFile(self.input, buf.ptr, @intCast(buf.len), &written, null) == 0) {
+            if (c.GetLastError() == c.ERROR_OPERATION_ABORTED) return error.Interrupted;
+            return error.PTYWriteFailed;
+        }
         return @intCast(written);
     }
 

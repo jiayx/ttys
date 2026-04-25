@@ -121,8 +121,7 @@ zig build -Dtarget=x86_64-linux-gnu
 
 Notes:
 
-- macOS uses system `libcurl` for websocket transport.
-- Linux defaults to the portable Zig transport and no longer ships separate `system` and `portable` release variants.
+- Unix-like targets use the built-in Zig WebSocket transport; no `libcurl` runtime dependency is required.
 - Windows uses `WinHTTP` plus `ConPTY`; this path builds successfully but still needs more runtime validation.
 
 ## Local Bootstrap Assets

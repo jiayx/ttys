@@ -1,4 +1,5 @@
 const std = @import("std");
+const sync = @import("sync.zig");
 
 const c = @cImport({
     @cDefine("_WIN32_WINNT", "0x0A00");
@@ -7,22 +8,7 @@ const c = @cImport({
 });
 
 const Allocator = std.mem.Allocator;
-
-const Mutex = struct {
-    state: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn lock(self: *Mutex) void {
-        while (true) {
-            if (self.state.cmpxchgWeak(false, true, .acquire, .monotonic) == null) return;
-            std.atomic.spinLoopHint();
-            sleepMillis(1);
-        }
-    }
-
-    fn unlock(self: *Mutex) void {
-        self.state.store(false, .release);
-    }
-};
+const Mutex = sync.Mutex;
 
 pub fn globalInit() !void {}
 pub fn globalDeinit() void {}
@@ -183,8 +169,4 @@ fn buildPathAndQuery(allocator: Allocator, uri: std.Uri) ![]u8 {
         }
     }
     return try list.toOwnedSlice();
-}
-
-fn sleepMillis(ms: u64) void {
-    _ = c.Sleep(@intCast(ms));
 }

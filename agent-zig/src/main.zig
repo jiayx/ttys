@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const pty_mod = @import("pty.zig");
+const sync = @import("sync.zig");
 const terminal_mod = @import("terminal.zig");
 const transport_mod = @import("transport.zig");
 
@@ -23,22 +24,7 @@ const RawTerminal = terminal_mod.RawTerminal;
 const TerminalSize = terminal_mod.TerminalSize;
 const getTerminalSize = terminal_mod.getTerminalSize;
 const WebSocketClient = transport_mod.WebSocketClient;
-
-const Mutex = struct {
-    state: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn lock(self: *Mutex) void {
-        while (true) {
-            if (self.state.cmpxchgWeak(false, true, .acquire, .monotonic) == null) return;
-            std.atomic.spinLoopHint();
-            sleepMillis(1);
-        }
-    }
-
-    fn unlock(self: *Mutex) void {
-        self.state.store(false, .release);
-    }
-};
+const Mutex = sync.Mutex;
 
 const Config = struct {
     server_url: []const u8 = "http://127.0.0.1:8787",
@@ -80,6 +66,12 @@ const ModalDecision = struct {
     action: ModalAction,
     viewer_id: []u8,
     lease_seconds: i32,
+};
+
+const StdinRead = union(enum) {
+    data: usize,
+    would_block,
+    eof,
 };
 
 const RunState = struct {
@@ -319,9 +311,13 @@ const ApprovalModal = struct {
         lines[0] = try centerText(self.allocator, inner_width, "Control Request");
         defer self.allocator.free(lines[0]);
         lines[1] = "";
-        lines[2] = try truncateText(self.allocator, inner_width, try std.fmt.allocPrint(self.allocator, "Viewer {s} wants control.", .{viewer_id}));
+        const viewer_line = try std.fmt.allocPrint(self.allocator, "Viewer {s} wants control.", .{viewer_id});
+        defer self.allocator.free(viewer_line);
+        lines[2] = try truncateText(self.allocator, inner_width, viewer_line);
         defer self.allocator.free(lines[2]);
-        lines[3] = try truncateText(self.allocator, inner_width, try std.fmt.allocPrint(self.allocator, "Lease: {d} minutes", .{lease_minutes}));
+        const lease_line = try std.fmt.allocPrint(self.allocator, "Lease: {d} minutes", .{lease_minutes});
+        defer self.allocator.free(lease_line);
+        lines[3] = try truncateText(self.allocator, inner_width, lease_line);
         defer self.allocator.free(lines[3]);
         lines[4] = "";
         lines[5] = try truncateText(self.allocator, inner_width, "Press Y to approve or N to deny.");
@@ -436,18 +432,19 @@ pub fn main(init: std.process.Init) !void {
 fn ptyReaderMain(ctx: *ThreadContext) void {
     var buf: [4096]u8 = undefined;
     while (!ctx.state.isDone()) {
-        const n = ctx.pty.read(&buf);
+        const n = ctx.pty.read(&buf) catch |err| switch (err) {
+            error.Interrupted => continue,
+            else => {
+                ctx.state.finishErrFmt("PTY read failed: {s}", .{@errorName(err)});
+                return;
+            },
+        };
         if (n == 0) {
             ctx.state.finishOk();
             return;
         }
-        if (n < 0) {
-            if (isInterrupted()) continue;
-            ctx.state.finishErrFmt("PTY read failed: code={d}", .{lastIOErrorCode()});
-            return;
-        }
 
-        ctx.modal.handlePTYOutput(buf[0..@intCast(n)], ctx.output) catch |err| {
+        ctx.modal.handlePTYOutput(buf[0..n], ctx.output) catch |err| {
             ctx.state.finishErrFmt("PTY output failed: {s}", .{@errorName(err)});
             return;
         };
@@ -473,6 +470,7 @@ fn websocketReaderMain(ctx: *ThreadContext) void {
         }
 
         const text = maybe_text.?;
+        defer ctx.allocator.free(text);
         handleControlFrame(ctx, text) catch |err| {
             ctx.state.finishErrFmt("frame handling failed: {s}", .{@errorName(err)});
             return;
@@ -483,20 +481,19 @@ fn websocketReaderMain(ctx: *ThreadContext) void {
 fn stdinMain(ctx: *ThreadContext) void {
     var buf: [4096]u8 = undefined;
     while (!ctx.state.isDone()) {
-        const n = readStdin(&buf);
-        if (n == 0) {
-            return;
-        }
-        if (n == -2) {
-            continue;
-        }
-        if (n < 0) {
-            if (isInterrupted()) continue;
-            ctx.state.finishErrFmt("stdin read failed: code={d}", .{lastIOErrorCode()});
-            return;
-        }
+        const n = switch (readStdin(&buf) catch |err| switch (err) {
+            error.Interrupted => continue,
+            else => {
+                ctx.state.finishErrFmt("stdin read failed: {s}", .{@errorName(err)});
+                return;
+            },
+        }) {
+            .data => |n| n,
+            .would_block => continue,
+            .eof => return,
+        };
 
-        const chunk = buf[0..@intCast(n)];
+        const chunk = buf[0..n];
         const maybe_decision = ctx.modal.handleLocalInput(chunk, ctx.output) catch |err| {
             ctx.state.finishErrFmt("local input failed: {s}", .{@errorName(err)});
             return;
@@ -512,10 +509,10 @@ fn stdinMain(ctx: *ThreadContext) void {
         }
 
         if (ctx.modal.active) continue;
-        if (writeAllPTY(ctx.pty, chunk) != chunk.len) {
-            ctx.state.finishStatic("PTY write failed");
+        writeAllPTY(ctx.pty, chunk) catch |err| {
+            ctx.state.finishErrFmt("PTY write failed: {s}", .{@errorName(err)});
             return;
-        }
+        };
     }
 }
 
@@ -555,7 +552,7 @@ fn handleControlFrame(ctx: *ThreadContext, payload: []const u8) !void {
         if (payload_value != .object) return;
         const data_value = payload_value.object.get("data") orelse return;
         if (data_value != .string) return;
-        _ = writeAllPTY(ctx.pty, data_value.string);
+        try writeAllPTY(ctx.pty, data_value.string);
         return;
     }
 
@@ -571,14 +568,22 @@ fn sendDecision(ctx: *ThreadContext, decision: ModalDecision) !void {
     defer message.deinit();
 
     switch (decision.action) {
-        .approve => try message.print(
-            "{{\"type\":\"control.approve\",\"payload\":{{\"viewerId\":\"{s}\",\"leaseSeconds\":{d}}}}}",
-            .{ try jsonEscapeAlloc(ctx.allocator, decision.viewer_id), decision.lease_seconds },
-        ),
-        .reject => try message.print(
-            "{{\"type\":\"control.reject\",\"payload\":{{\"viewerId\":\"{s}\"}}}}",
-            .{try jsonEscapeAlloc(ctx.allocator, decision.viewer_id)},
-        ),
+        .approve => {
+            const viewer_id = try jsonEscapeAlloc(ctx.allocator, decision.viewer_id);
+            defer ctx.allocator.free(viewer_id);
+            try message.print(
+                "{{\"type\":\"control.approve\",\"payload\":{{\"viewerId\":\"{s}\",\"leaseSeconds\":{d}}}}}",
+                .{ viewer_id, decision.lease_seconds },
+            );
+        },
+        .reject => {
+            const viewer_id = try jsonEscapeAlloc(ctx.allocator, decision.viewer_id);
+            defer ctx.allocator.free(viewer_id);
+            try message.print(
+                "{{\"type\":\"control.reject\",\"payload\":{{\"viewerId\":\"{s}\"}}}}",
+                .{viewer_id},
+            );
+        },
     }
 
     try ctx.ws.writeJSON(message.items);
@@ -825,18 +830,13 @@ fn truncateText(allocator: Allocator, width: i32, value: []const u8) ![]u8 {
     return try output.toOwnedSlice();
 }
 
-fn writeAllPTY(pty: *const PTY, bytes: []const u8) usize {
+fn writeAllPTY(pty: *const PTY, bytes: []const u8) !void {
     var offset: usize = 0;
     while (offset < bytes.len) {
-        const written = pty.write(bytes[offset..]);
-        if (written < 0) {
-            if (isInterrupted()) continue;
-            break;
-        }
-        if (written == 0) break;
-        offset += @intCast(written);
+        const written = try pty.write(bytes[offset..]);
+        if (written == 0) return error.PTYWriteZero;
+        offset += written;
     }
-    return offset;
 }
 
 fn sleepMillis(ms: u64) void {
@@ -907,14 +907,18 @@ fn writeStderrAll(bytes: []const u8) !void {
     }
 }
 
-fn readStdin(buf: []u8) isize {
+fn readStdin(buf: []u8) !StdinRead {
     if (builtin.os.tag == .windows) {
         const handle = win_c.GetStdHandle(win_c.STD_INPUT_HANDLE);
-        if (handle == null or handle == win_c.INVALID_HANDLE_VALUE) return -1;
+        if (handle == null or handle == win_c.INVALID_HANDLE_VALUE) return error.StdinReadFailed;
 
         var read_count: win_c.DWORD = 0;
-        if (win_c.ReadFile(handle, buf.ptr, @intCast(buf.len), &read_count, null) == 0) return -1;
-        return @intCast(read_count);
+        if (win_c.ReadFile(handle, buf.ptr, @intCast(buf.len), &read_count, null) == 0) {
+            if (isInterrupted()) return error.Interrupted;
+            return error.StdinReadFailed;
+        }
+        if (read_count == 0) return .eof;
+        return .{ .data = @intCast(read_count) };
     }
 
     var poll_fd = posix_c.pollfd{
@@ -923,10 +927,19 @@ fn readStdin(buf: []u8) isize {
         .revents = 0,
     };
     const poll_result = posix_c.poll(&poll_fd, 1, 100);
-    if (poll_result == 0) return -2;
-    if (poll_result < 0) return -1;
+    if (poll_result == 0) return .would_block;
+    if (poll_result < 0) {
+        if (isInterrupted()) return error.Interrupted;
+        return error.StdinReadFailed;
+    }
 
-    return posix_c.read(0, buf.ptr, buf.len);
+    const read_count = posix_c.read(0, buf.ptr, buf.len);
+    if (read_count < 0) {
+        if (isInterrupted()) return error.Interrupted;
+        return error.StdinReadFailed;
+    }
+    if (read_count == 0) return .eof;
+    return .{ .data = @intCast(read_count) };
 }
 
 fn isInterrupted() bool {

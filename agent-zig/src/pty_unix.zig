@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const c = if (builtin.os.tag == .linux) @cImport({
+    @cInclude("errno.h");
     @cInclude("pty.h");
     @cInclude("poll.h");
     @cInclude("signal.h");
@@ -9,6 +10,7 @@ const c = if (builtin.os.tag == .linux) @cImport({
     @cInclude("sys/wait.h");
     @cInclude("unistd.h");
 }) else @cImport({
+    @cInclude("errno.h");
     @cInclude("poll.h");
     @cInclude("signal.h");
     @cInclude("sys/ioctl.h");
@@ -45,12 +47,22 @@ pub const PTY = struct {
         _ = c.close(self.master_fd);
     }
 
-    pub fn read(self: *const PTY, buf: []u8) isize {
-        return c.read(self.master_fd, buf.ptr, buf.len);
+    pub fn read(self: *const PTY, buf: []u8) !usize {
+        const n = c.read(self.master_fd, buf.ptr, buf.len);
+        if (n < 0) {
+            if (errno() == c.EINTR) return error.Interrupted;
+            return error.PTYReadFailed;
+        }
+        return @intCast(n);
     }
 
-    pub fn write(self: *const PTY, buf: []const u8) isize {
-        return c.write(self.master_fd, buf.ptr, buf.len);
+    pub fn write(self: *const PTY, buf: []const u8) !usize {
+        const n = c.write(self.master_fd, buf.ptr, buf.len);
+        if (n < 0) {
+            if (errno() == c.EINTR) return error.Interrupted;
+            return error.PTYWriteFailed;
+        }
+        return @intCast(n);
     }
 
     pub fn resize(self: *const PTY, cols: u16, rows: u16) void {
@@ -74,3 +86,7 @@ pub const PTY = struct {
         if (c.WIFSIGNALED(status)) return error.ChildSignaled;
     }
 };
+
+fn errno() c_int {
+    return std.posix.system._errno().*;
+}
