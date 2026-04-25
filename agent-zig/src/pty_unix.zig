@@ -55,6 +55,9 @@ pub const PTY = struct {
         const n = c.read(self.master_fd, buf.ptr, buf.len);
         if (n < 0) {
             if (errno() == c.EINTR) return error.Interrupted;
+            // Linux reports EIO on the PTY master when the slave side closes.
+            // Treat it like EOF so Ctrl-D / exit ends the session cleanly.
+            if (errno() == c.EIO) return 0;
             return error.PTYReadFailed;
         }
         return @intCast(n);
