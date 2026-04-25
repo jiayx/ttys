@@ -3,7 +3,6 @@ package protocol
 import "encoding/json"
 
 const (
-	TypeStdin          = "stdin"
 	TypeSessionStatus  = "session.status"
 	TypeControlRequest = "control.request"
 	TypeControlApprove = "control.approve"
@@ -11,13 +10,33 @@ const (
 	TypeControlRevoke  = "control.revoke"
 )
 
+const (
+	BinaryTTYOutput byte = 0x01
+	BinaryStdin     byte = 0x02
+)
+
 type Envelope struct {
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"payload"`
 }
 
-type StdinPayload struct {
-	Data string `json:"data"`
+func EncodeBinary(messageType byte, payload []byte) []byte {
+	msg := make([]byte, len(payload)+1)
+	msg[0] = messageType
+	copy(msg[1:], payload)
+	return msg
+}
+
+func DecodeBinary(payload []byte) (byte, []byte, bool) {
+	if len(payload) == 0 {
+		return 0, nil, false
+	}
+	switch payload[0] {
+	case BinaryTTYOutput, BinaryStdin:
+		return payload[0], payload[1:], true
+	default:
+		return 0, nil, false
+	}
 }
 
 type ControlRequestPayload struct {

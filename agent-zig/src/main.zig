@@ -28,7 +28,7 @@ const Mutex = sync.Mutex;
 const nested_agent_env = "TTYS_AGENT_ACTIVE";
 
 const Config = struct {
-    server_url: []const u8 = "http://127.0.0.1:8787",
+    server_url: []const u8 = "http://localhost:5173",
     session_id: ?[]const u8 = null,
     shell: ?[]const u8 = null,
 };
@@ -1138,12 +1138,12 @@ test "url helpers render HTTP and websocket routes correctly" {
 test "uriToStringAlloc formats URI text rather than debug output" {
     const allocator = std.testing.allocator;
 
-    var uri = try std.Uri.parse("http://127.0.0.1:5173");
+    var uri = try std.Uri.parse("http://localhost:5173");
     uri.path = .{ .raw = "/api/session" };
     uri.query = null;
     uri.fragment = null;
 
     const rendered = try uriToStringAlloc(allocator, uri);
     defer allocator.free(rendered);
-    try std.testing.expectEqualStrings("http://127.0.0.1:5173/api/session", rendered);
+    try std.testing.expectEqualStrings("http://localhost:5173/api/session", rendered);
 }

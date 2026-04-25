@@ -8,6 +8,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	TextMessage   = websocket.TextMessage
+	BinaryMessage = websocket.BinaryMessage
+)
+
 type Client struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
@@ -30,6 +35,12 @@ func (c *Client) WriteText(data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conn.WriteMessage(websocket.TextMessage, data)
+}
+
+func (c *Client) WriteBinary(data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
 func (c *Client) WriteJSON(v any) error {

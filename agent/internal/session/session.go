@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/term"
 
@@ -20,6 +21,63 @@ import (
 	"github.com/jiayx/ttys/agent/internal/pty"
 	"github.com/jiayx/ttys/agent/internal/transport"
 )
+
+var errSocketDisconnected = errors.New("websocket is not connected")
+
+type socketSlot struct {
+	mu     sync.Mutex
+	client *transport.Client
+}
+
+func (s *socketSlot) set(client *transport.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.client = client
+}
+
+func (s *socketSlot) clear(client *transport.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.client == client {
+		s.client = nil
+	}
+}
+
+func (s *socketSlot) closeCurrent() {
+	s.mu.Lock()
+	client := s.client
+	s.client = nil
+	s.mu.Unlock()
+
+	if client != nil {
+		_ = client.Close()
+	}
+}
+
+func (s *socketSlot) current() (*transport.Client, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.client == nil {
+		return nil, errSocketDisconnected
+	}
+	return s.client, nil
+}
+
+func (s *socketSlot) writeBinary(data []byte) error {
+	client, err := s.current()
+	if err != nil {
+		return err
+	}
+	return client.WriteBinary(data)
+}
+
+func (s *socketSlot) writeJSON(v any) error {
+	client, err := s.current()
+	if err != nil {
+		return err
+	}
+	return client.WriteJSON(v)
+}
 
 type Config struct {
 	ServerURL string
@@ -45,6 +103,12 @@ func Run(ctx context.Context, cfg Config) error {
 	default:
 	}
 
+	if os.Getenv(nestedAgentEnv) != "" {
+		fmt.Fprintln(os.Stderr, "ttys-agent is already active in this terminal session.")
+		fmt.Fprintln(os.Stderr, "Open a new local terminal, or exit the current shared shell before starting another agent.")
+		return nil
+	}
+
 	shellPath := cfg.Shell
 	if shellPath == "" {
 		shellPath = platform.DefaultShell()
@@ -61,25 +125,13 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer terminal.Close()
 
-	fmt.Fprintf(os.Stdout, "Share URL: %s\n", connectInfo.ViewerURL)
-	fmt.Fprintln(os.Stdout, "Exit this shared shell with Ctrl-D or 'exit'.")
-
-	rawTerminal, err := enterRawTerminal()
-	if err != nil {
-		return err
-	}
-	defer rawTerminal.Close()
-
-	client, err := transport.Dial(ctx, connectInfo.HostWebSocketURL)
-	if err != nil {
-		return err
-	}
-	defer client.Close()
-
 	modal := newApprovalModal(os.Stdout)
+	socket := &socketSlot{}
+	defer socket.closeCurrent()
 
 	errCh := make(chan error, 4)
 	done := make(chan struct{})
+	firstSocketConnected := make(chan struct{})
 	statusCh := make(chan protocol.SessionStatusPayload, 4)
 	decisionCh := make(chan modalDecision, 2)
 	var once sync.Once
@@ -98,17 +150,53 @@ func Run(ctx context.Context, cfg Config) error {
 		if _, writeErr := os.Stdout.Write(data); writeErr != nil {
 			return writeErr
 		}
-		return client.WriteText(data)
+		_ = socket.writeBinary(protocol.EncodeBinary(protocol.BinaryTTYOutput, data))
+		return nil
 	}
 
 	go func() {
-		if runErr := streamPTYOutput(terminal, modal, forwardOutput, done); runErr != nil {
+		if runErr := manageSocket(ctx, connectInfo.HostWebSocketURL, socket, terminal, statusCh, firstSocketConnected, done); runErr != nil {
 			stop(runErr)
 		}
 	}()
 
 	go func() {
-		if runErr := streamSocketFrames(terminal, client, statusCh, done); runErr != nil {
+		if waitErr := terminal.Wait(); waitErr != nil {
+			stop(waitErr)
+			return
+		}
+		stop(io.EOF)
+	}()
+
+	select {
+	case <-firstSocketConnected:
+	case <-ctx.Done():
+		return nil
+	case runErr := <-errCh:
+		printSessionEnded(!errors.Is(runErr, io.EOF))
+		if errors.Is(runErr, io.EOF) {
+			return nil
+		}
+		return runErr
+	}
+
+	printSessionStarted(connectInfo.ViewerURL)
+
+	rawTerminal, err := enterRawTerminal()
+	if err != nil {
+		return err
+	}
+	rawClosed := false
+	closeRawTerminal := func() {
+		if !rawClosed {
+			_ = rawTerminal.Close()
+			rawClosed = true
+		}
+	}
+	defer closeRawTerminal()
+
+	go func() {
+		if runErr := streamPTYOutput(terminal, modal, forwardOutput, done); runErr != nil {
 			stop(runErr)
 		}
 	}()
@@ -126,30 +214,42 @@ func Run(ctx context.Context, cfg Config) error {
 	}()
 
 	go func() {
-		if runErr := forwardModalDecisions(client, decisionCh, done); runErr != nil {
+		if runErr := forwardModalDecisions(socket, decisionCh, done); runErr != nil {
 			stop(runErr)
 		}
 	}()
 
 	go watchResize(terminal, modal, done)
 
-	go func() {
-		if waitErr := terminal.Wait(); waitErr != nil {
-			stop(waitErr)
-			return
-		}
-		stop(io.EOF)
-	}()
-
 	select {
 	case <-ctx.Done():
+		closeRawTerminal()
+		printSessionEnded(false)
 		return nil
 	case runErr := <-errCh:
+		closeRawTerminal()
 		if errors.Is(runErr, io.EOF) {
+			printSessionEnded(false)
 			return nil
 		}
+		printSessionEnded(true)
 		return runErr
 	}
+}
+
+func printSessionStarted(viewerURL string) {
+	fmt.Fprintln(os.Stderr, "ttys-agent: shared shell is active.")
+	fmt.Fprintf(os.Stderr, "Share URL: %s\n", viewerURL)
+	fmt.Fprintln(os.Stderr, "Exit the shared shell with Ctrl-D or 'exit'.")
+	fmt.Fprintln(os.Stderr)
+}
+
+func printSessionEnded(failed bool) {
+	if failed {
+		fmt.Fprintln(os.Stderr, "\nttys-agent: shared shell ended with an error.")
+		return
+	}
+	fmt.Fprintln(os.Stderr, "\nttys-agent: shared shell ended. Remote access is closed.")
 }
 
 func resolveConnection(ctx context.Context, cfg Config) (connectInfo, error) {
@@ -283,32 +383,80 @@ func streamPTYOutput(
 	}
 }
 
-func streamSocketFrames(
+func manageSocket(
+	ctx context.Context,
+	hostWebSocketURL string,
+	slot *socketSlot,
 	terminal *pty.Session,
-	client *transport.Client,
 	statusCh chan<- protocol.SessionStatusPayload,
+	firstConnected chan<- struct{},
 	done <-chan struct{},
 ) error {
+	delay := 250 * time.Millisecond
+	var once sync.Once
 	for {
 		select {
 		case <-done:
 			return nil
+		case <-ctx.Done():
+			return nil
 		default:
 		}
 
-		_, payload, err := client.ReadMessage()
+		client, err := transport.Dial(ctx, hostWebSocketURL)
 		if err != nil {
-			return err
+			select {
+			case <-done:
+				return nil
+			case <-ctx.Done():
+				return nil
+			case <-time.After(delay):
+			}
+			delay = minDuration(delay*2, 5*time.Second)
+			continue
 		}
 
-		if err := handleControlFrame(terminal, payload, statusCh); err != nil {
-			return err
+		delay = 250 * time.Millisecond
+		slot.set(client)
+		once.Do(func() {
+			close(firstConnected)
+		})
+		readSocketFrames(terminal, client, statusCh, done)
+		slot.clear(client)
+		_ = client.Close()
+	}
+}
+
+func readSocketFrames(
+	terminal *pty.Session,
+	client *transport.Client,
+	statusCh chan<- protocol.SessionStatusPayload,
+	done <-chan struct{},
+) {
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
+		messageType, payload, err := client.ReadMessage()
+		if err != nil {
+			return
+		}
+
+		switch messageType {
+		case transport.TextMessage:
+			_ = handleControlFrame(payload, statusCh)
+		case transport.BinaryMessage:
+			if kind, data, ok := protocol.DecodeBinary(payload); ok && kind == protocol.BinaryStdin {
+				_, _ = terminal.Write(data)
+			}
 		}
 	}
 }
 
 func handleControlFrame(
-	terminal *pty.Session,
 	payload []byte,
 	statusCh chan<- protocol.SessionStatusPayload,
 ) error {
@@ -318,13 +466,6 @@ func handleControlFrame(
 	}
 
 	switch envelope.Type {
-	case protocol.TypeStdin:
-		var stdin protocol.StdinPayload
-		if err := json.Unmarshal(envelope.Payload, &stdin); err != nil {
-			return err
-		}
-		_, err := terminal.Write([]byte(stdin.Data))
-		return err
 	case protocol.TypeSessionStatus:
 		var status protocol.SessionStatusPayload
 		if err := json.Unmarshal(envelope.Payload, &status); err != nil {
@@ -338,6 +479,13 @@ func handleControlFrame(
 	default:
 		return nil
 	}
+}
+
+func minDuration(left, right time.Duration) time.Duration {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func streamLocalInput(
@@ -404,7 +552,7 @@ func handleSessionStatus(
 }
 
 func forwardModalDecisions(
-	client *transport.Client,
+	socket *socketSlot,
 	decisionCh <-chan modalDecision,
 	done <-chan struct{},
 ) error {
@@ -415,22 +563,22 @@ func forwardModalDecisions(
 		case decision := <-decisionCh:
 			switch decision.Action {
 			case modalApprove:
-				if err := client.WriteJSON(map[string]any{
+				if err := socket.writeJSON(map[string]any{
 					"type": protocol.TypeControlApprove,
 					"payload": protocol.ControlApprovePayload{
 						ViewerID:     decision.ViewerID,
 						LeaseSeconds: decision.LeaseSeconds,
 					},
-				}); err != nil {
+				}); err != nil && !errors.Is(err, errSocketDisconnected) {
 					return err
 				}
 			case modalReject:
-				if err := client.WriteJSON(map[string]any{
+				if err := socket.writeJSON(map[string]any{
 					"type": protocol.TypeControlReject,
 					"payload": protocol.ControlRejectPayload{
 						ViewerID: decision.ViewerID,
 					},
-				}); err != nil {
+				}); err != nil && !errors.Is(err, errSocketDisconnected) {
 					return err
 				}
 			}

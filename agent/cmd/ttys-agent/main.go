@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	server := flag.String("server", "http://127.0.0.1:8787", "ttys server base URL or direct host websocket URL")
+	server := flag.String("server", "http://localhost:5173", "ttys server base URL or direct host websocket URL")
 	sessionID := flag.String("session", "", "existing session ID to attach as host when using an HTTP server URL")
 	shell := flag.String("shell", "", "shell to launch")
 	flag.Parse()

@@ -68,26 +68,26 @@ go build ./...
 Run against a local server:
 
 ```bash
-./scripts/start.sh http://127.0.0.1:5173
+./scripts/start.sh http://localhost:5173
 ```
 
 Attach to an existing session:
 
 ```bash
-./scripts/start.sh http://127.0.0.1:5173 <session-id>
+./scripts/start.sh http://localhost:5173 <session-id>
 ```
 
 Windows PowerShell entrypoint:
 
 ```powershell
-./scripts/start.ps1 -Server http://127.0.0.1:5173
+./scripts/start.ps1 -Server http://localhost:5173
 ```
 
 Direct Go CLI usage:
 
 ```bash
 cd agent
-go run ./cmd/ttys-agent -server http://127.0.0.1:5173
+go run ./cmd/ttys-agent -server http://localhost:5173
 ```
 
 Flags:

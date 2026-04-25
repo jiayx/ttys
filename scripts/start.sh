@@ -2,7 +2,7 @@
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-SERVER_URL=${1:-http://127.0.0.1:5173}
+SERVER_URL=${1:-http://localhost:5173}
 SESSION_ID=${2:-}
 
 cd "$ROOT_DIR/agent"

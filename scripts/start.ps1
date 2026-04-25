@@ -1,5 +1,5 @@
 param(
-  [string]$Server = "http://127.0.0.1:5173",
+  [string]$Server = "http://localhost:5173",
   [string]$Session = ""
 )
 
