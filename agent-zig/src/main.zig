@@ -516,7 +516,8 @@ pub fn main(init: std.process.Init) !void {
     try printSessionStarted(connect_info.viewer_url);
 
     const raw_terminal = try RawTerminal.enter();
-    defer raw_terminal.leave();
+    var raw_terminal_active = true;
+    defer if (raw_terminal_active) raw_terminal.leave();
 
     var ws = WebSocketSlot{};
 
@@ -557,6 +558,8 @@ pub fn main(init: std.process.Init) !void {
     const err = state.wait();
     output.flushRemoteDue(true);
     ws.closeCurrent();
+    raw_terminal.leave();
+    raw_terminal_active = false;
 
     if (err) |message| {
         try printSessionEnded(true);
