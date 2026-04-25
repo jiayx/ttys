@@ -528,13 +528,20 @@ export function App() {
     <main className="min-h-screen bg-stone-950 text-stone-100">
       <section className="mx-auto flex min-h-screen max-w-6xl flex-col px-6 py-8">
         <header className="mb-6 flex items-start justify-between gap-4">
-          <div>
-            <p className="text-xs uppercase tracking-[0.32em] text-amber-400">
-              ttys
-            </p>
-            <h1 className="mt-2 text-xl font-medium tracking-tight text-stone-200">
-              Live terminal sharing
-            </h1>
+          <div className="flex items-center gap-3">
+            <img
+              src="/logo.svg"
+              alt=""
+              className="h-12 w-12 shadow-[0_0_32px_rgba(251,191,36,0.18)]"
+            />
+            <div>
+              <p className="text-xs uppercase tracking-[0.32em] text-amber-400">
+                ttys
+              </p>
+              <h1 className="mt-2 text-xl font-medium tracking-tight text-stone-200">
+                Live terminal sharing
+              </h1>
+            </div>
           </div>
           <div className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-300">
             {connectionLabel}

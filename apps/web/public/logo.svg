@@ -1,0 +1,10 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">ttys logo</title>
+  <desc id="desc">A minimal terminal prompt mark.</desc>
+  <rect x="4" y="4" width="248" height="248" rx="54" fill="#1C1917" stroke="#44403C" stroke-width="8"/>
+  <path d="M4 73H252" stroke="#44403C" stroke-width="8"/>
+  <circle cx="48" cy="42" r="10" fill="#FBBF24"/>
+  <circle cx="84" cy="42" r="10" fill="#34D399"/>
+  <path d="M64 126L108 160L64 194" stroke="#FBBF24" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M138 194H205" stroke="#34D399" stroke-width="22" stroke-linecap="round"/>
+</svg>

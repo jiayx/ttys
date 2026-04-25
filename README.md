@@ -12,8 +12,8 @@ Anonymous shared terminal over Cloudflare Workers and Durable Objects.
 ## Current State
 
 - The web app can create a session, attach viewers, and bridge host/viewer websocket traffic through the Worker.
-- The Go agent is the main implementation.
-- The Zig agent is being brought up against the Go behavior. It currently builds on macOS, Windows, and Linux, but it should still be treated as under validation rather than fully parity-complete.
+- The Zig agent is the default implementation used by bootstrap downloads.
+- The Go agent remains available as a reference implementation and local development fallback.
 
 ## Repository Layout
 
@@ -126,15 +126,15 @@ Notes:
 
 ## Local Bootstrap Assets
 
-Build a local Go agent into the web download directory:
+Build a local Zig agent into the web download directory:
 
 ```bash
 ./scripts/build-local-agent.sh
 ```
 
-This writes the current machine's Go agent binary to:
+This writes the current machine's Zig agent binary to:
 
-- `apps/web/public/downloads/local/ttys-agent-<os>-<arch>[.exe]`
+- `apps/web/public/downloads/local/ttys-agent-zig-<os>-<arch>[.exe]`
 - `apps/web/public/downloads/local/checksums.txt`
 
 ## CI and Releases
@@ -162,6 +162,6 @@ On `v*` tags, the workflow also publishes all assets plus `checksums.txt` to Git
 
 ## Status Guidance
 
-If you want the most conservative path today, use the Go agent.
+Bootstrap downloads use the Zig agent by default.
 
 On Linux, the Zig release binary uses the portable transport by default.

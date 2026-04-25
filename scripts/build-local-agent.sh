@@ -3,15 +3,12 @@ set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT_DIR="$ROOT_DIR/apps/web/public/downloads/local"
-CACHE_DIR="$ROOT_DIR/agent/.cache/go-build"
-MOD_CACHE_DIR="$ROOT_DIR/agent/.cache/go-mod"
-
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 
 case "$ARCH" in
-  x86_64|amd64) GOARCH_VALUE="amd64" ;;
-  arm64|aarch64) GOARCH_VALUE="arm64" ;;
+  x86_64|amd64) ARCH_VALUE="amd64" ;;
+  arm64|aarch64) ARCH_VALUE="arm64" ;;
   *)
     echo "unsupported architecture: $ARCH" >&2
     exit 1
@@ -21,11 +18,11 @@ esac
 case "$OS" in
   darwin|linux)
     EXT=""
-    GOOS_VALUE="$OS"
+    OS_VALUE="$OS"
     ;;
   mingw*|msys*|cygwin*)
     EXT=".exe"
-    GOOS_VALUE="windows"
+    OS_VALUE="windows"
     ;;
   *)
     echo "unsupported operating system: $OS" >&2
@@ -34,16 +31,13 @@ case "$OS" in
 esac
 
 mkdir -p "$OUT_DIR"
-mkdir -p "$CACHE_DIR"
-mkdir -p "$MOD_CACHE_DIR"
 
-ASSET_NAME="ttys-agent-$GOOS_VALUE-$GOARCH_VALUE$EXT"
+ASSET_NAME="ttys-agent-zig-$OS_VALUE-$ARCH_VALUE$EXT"
 
 (
-  cd "$ROOT_DIR/agent"
-  GOCACHE="$CACHE_DIR" GOMODCACHE="$MOD_CACHE_DIR" \
-    GOOS="$GOOS_VALUE" GOARCH="$GOARCH_VALUE" CGO_ENABLED=0 \
-    go build -o "$OUT_DIR/$ASSET_NAME" ./cmd/ttys-agent
+  cd "$ROOT_DIR/agent-zig"
+  zig build
+  cp "zig-out/bin/ttys-agent-zig$EXT" "$OUT_DIR/$ASSET_NAME"
 )
 
 if command -v shasum >/dev/null 2>&1; then

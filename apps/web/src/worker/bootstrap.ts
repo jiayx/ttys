@@ -43,7 +43,7 @@ case "$OS" in
 esac
 
 mkdir -p "$TMP_DIR"
-ASSET_NAME="ttys-agent-$OS-$ARCH"
+ASSET_NAME="ttys-agent-zig-$OS-$ARCH"
 AGENT_PATH="$TMP_DIR/$ASSET_NAME"
 DOWNLOAD_URL="$BINARY_BASE_URL/$ASSET_NAME"
 CHECKSUMS_PATH="$TMP_DIR/ttys-agent-checksums.txt"
@@ -121,7 +121,7 @@ switch ($env:PROCESSOR_ARCHITECTURE.ToLower()) {
 
 $Tmp = Join-Path ([System.IO.Path]::GetTempPath()) "ttys"
 New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
-$AssetName = "ttys-agent-$Os-$Arch.exe"
+$AssetName = "ttys-agent-zig-$Os-$Arch.exe"
 $AgentPath = Join-Path $Tmp $AssetName
 $DownloadUrl = "$BinaryBaseUrl/$AssetName"
 $ChecksumsPath = Join-Path $Tmp "ttys-agent-checksums.txt"

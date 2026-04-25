@@ -18,11 +18,11 @@ type ReleaseManifest = {
 };
 
 const releaseTargets = {
-  "darwin-amd64": "ttys-agent-darwin-amd64",
-  "darwin-arm64": "ttys-agent-darwin-arm64",
-  "linux-amd64": "ttys-agent-linux-amd64",
-  "linux-arm64": "ttys-agent-linux-arm64",
-  "windows-amd64": "ttys-agent-windows-amd64.exe",
+  "darwin-amd64": "ttys-agent-zig-darwin-amd64",
+  "darwin-arm64": "ttys-agent-zig-darwin-arm64",
+  "linux-amd64": "ttys-agent-zig-linux-amd64",
+  "linux-arm64": "ttys-agent-zig-linux-arm64",
+  "windows-amd64": "ttys-agent-zig-windows-amd64.exe",
 } as const;
 
 export default {
