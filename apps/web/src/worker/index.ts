@@ -101,7 +101,7 @@ export default {
       }
       const id = env.TTY_SESSION.idFromName(sessionId);
       const stub = env.TTY_SESSION.get(id);
-      return stub.fetch("https://session.internal/status");
+      return stub.fetch(`https://session.internal/status${url.search}`);
     }
 
     const match = url.pathname.match(
@@ -115,7 +115,7 @@ export default {
       const id = env.TTY_SESSION.idFromName(sessionId);
       const stub = env.TTY_SESSION.get(id);
       return stub.fetch(
-        new Request(`https://session.internal/connect/${role}`, request),
+        new Request(`https://session.internal/connect/${role}${url.search}`, request),
       );
     }
 

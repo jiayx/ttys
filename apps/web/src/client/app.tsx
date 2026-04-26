@@ -20,6 +20,7 @@ type SessionStatus = {
   hostConnected: boolean;
   viewerCount: number;
   viewerId: string | null;
+  viewerToken: string | null;
   canWrite: boolean;
   controllerViewerId: string | null;
   controlLeaseExpiresAt: number | null;
@@ -151,6 +152,12 @@ export function App() {
     const currentSessionId = sessionId;
     let cancelled = false;
     let activeSocket: WebSocket | null = null;
+    let connectionGeneration = 0;
+    type ConnectionAttempt = {
+      isStale: () => boolean;
+      ownsSocket: (ws: WebSocket) => boolean;
+      scheduleRetry: (delay: number, retry: () => void) => void;
+    };
 
     function clearReconnectTimer() {
       if (reconnectTimer.current !== null) {
@@ -171,7 +178,7 @@ export function App() {
     }
 
     async function fetchSessionStatus(): Promise<SessionStatus | null> {
-      const response = await fetch(`/api/session/${currentSessionId}`);
+      const response = await fetch(sessionStatusURL(currentSessionId));
       if (!response.ok) {
         if (shouldRetrySessionStatus(response)) {
           return null;
@@ -181,16 +188,28 @@ export function App() {
       return (await response.json()) as SessionStatus;
     }
 
-    function scheduleStatusRetry(delay: number, retry: () => void) {
-      reconnectTimer.current = window.setTimeout(() => {
-        if (cancelled) {
-          return;
-        }
-        retry();
-      }, delay);
+    function startAttempt(): ConnectionAttempt {
+      const generation = ++connectionGeneration;
+      return {
+        isStale() {
+          return cancelled || generation !== connectionGeneration;
+        },
+        ownsSocket(ws: WebSocket) {
+          return !this.isStale() && activeSocket === ws;
+        },
+        scheduleRetry(delay: number, retry: () => void) {
+          reconnectTimer.current = window.setTimeout(() => {
+            if (this.isStale()) {
+              return;
+            }
+            retry();
+          }, delay);
+        },
+      };
     }
 
     async function connectViewer() {
+      const attempt = startAttempt();
       clearReconnectTimer();
       setConnecting(true);
       setTransportState("connecting");
@@ -199,7 +218,7 @@ export function App() {
       try {
         status = await fetchSessionStatus();
       } catch (error) {
-        if (cancelled) {
+        if (attempt.isStale()) {
           return;
         }
         if (error instanceof SessionEndedError) {
@@ -211,11 +230,11 @@ export function App() {
         setStatusNote("Unable to reach the server. Retrying...");
         setTransportState("reconnecting");
         setConnecting(false);
-        void scheduleReconnect();
+        void scheduleReconnect(attempt);
         return;
       }
 
-      if (cancelled) {
+      if (attempt.isStale()) {
         return;
       }
 
@@ -223,7 +242,7 @@ export function App() {
         setStatusNote("Unable to reach the server. Retrying...");
         setTransportState("reconnecting");
         setConnecting(false);
-        void scheduleReconnect();
+        void scheduleReconnect(attempt);
         return;
       }
 
@@ -231,21 +250,19 @@ export function App() {
         setSessionStatus(status);
         setTransportState("closed");
         setConnecting(false);
-        void scheduleOfflineStatusPoll();
+        void scheduleOfflineStatusPoll(attempt);
         return;
       }
 
       setSessionStatus(status);
 
-      const ws = new WebSocket(
-        sessionInfo?.viewerWebSocketUrl ?? viewerSocketURL(currentSessionId),
-      );
+      const ws = new WebSocket(viewerSocketURL(currentSessionId));
       ws.binaryType = "arraybuffer";
       activeSocket = ws;
       socket.current = ws;
 
       ws.addEventListener("open", () => {
-        if (cancelled || activeSocket !== ws) {
+        if (!attempt.ownsSocket(ws)) {
           return;
         }
         clearReconnectTimer();
@@ -255,6 +272,9 @@ export function App() {
       });
 
       ws.addEventListener("message", (event: MessageEvent<unknown>) => {
+        if (!attempt.ownsSocket(ws)) {
+          return;
+        }
         const data = event.data;
         if (typeof data !== "string") {
           void handleBinarySocketMessage(data, ws, terminal.current);
@@ -269,22 +289,23 @@ export function App() {
       });
 
       ws.addEventListener("close", () => {
-        if (activeSocket === ws) {
-          activeSocket = null;
+        if (!attempt.ownsSocket(ws)) {
+          return;
         }
+        activeSocket = null;
         if (socket.current === ws) {
           socket.current = null;
         }
-        if (cancelled || suppressReconnectRef.current) {
+        if (suppressReconnectRef.current) {
           return;
         }
         setTransportState("reconnecting");
         setConnecting(false);
-        void scheduleReconnect();
+        void scheduleReconnect(attempt);
       });
 
       ws.addEventListener("error", () => {
-        if (cancelled) {
+        if (!attempt.ownsSocket(ws)) {
           return;
         }
         setTransportState("error");
@@ -300,59 +321,68 @@ export function App() {
       }) ?? null;
     }
 
-    async function scheduleReconnect() {
+    async function scheduleReconnect(attempt: ConnectionAttempt) {
+      if (attempt.isStale()) {
+        return;
+      }
       clearReconnectTimer();
       reconnectAttempts.current += 1;
-      const attempt = reconnectAttempts.current;
-      const delay = Math.min(1000 * attempt, 5000);
+      const attemptNumber = reconnectAttempts.current;
+      const delay = Math.min(1000 * attemptNumber, 5000);
 
       try {
         const status = await fetchSessionStatus();
-        if (cancelled) {
+        if (attempt.isStale()) {
           return;
         }
 
         if (!status) {
-          scheduleStatusRetry(delay, () => void scheduleReconnect());
+          attempt.scheduleRetry(delay, () => void scheduleReconnect(attempt));
           return;
         }
 
         setSessionStatus(status);
         if (status.state === "closed") {
           setTransportState("closed");
-          void scheduleOfflineStatusPoll();
+          void scheduleOfflineStatusPoll(attempt);
           return;
         }
 
-        scheduleStatusRetry(delay, () => void connectViewer());
+        attempt.scheduleRetry(delay, () => void connectViewer());
       } catch (error) {
+        if (attempt.isStale()) {
+          return;
+        }
         if (error instanceof SessionEndedError) {
           setTransportState("closed");
           setStatusNote("Session ended. Refresh or create a new session.");
           return;
         }
-        scheduleStatusRetry(delay, () => void scheduleReconnect());
+        attempt.scheduleRetry(delay, () => void scheduleReconnect(attempt));
       }
     }
 
-    async function scheduleOfflineStatusPoll() {
+    async function scheduleOfflineStatusPoll(attempt: ConnectionAttempt) {
+      if (attempt.isStale()) {
+        return;
+      }
       clearReconnectTimer();
       setConnecting(false);
       setTransportState("closed");
 
       reconnectTimer.current = window.setTimeout(async () => {
-        if (cancelled) {
+        if (attempt.isStale()) {
           return;
         }
 
         try {
           const status = await fetchSessionStatus();
-          if (cancelled) {
+          if (attempt.isStale()) {
             return;
           }
 
           if (!status) {
-            void scheduleOfflineStatusPoll();
+            void scheduleOfflineStatusPoll(attempt);
             return;
           }
 
@@ -362,14 +392,14 @@ export function App() {
             return;
           }
 
-          void scheduleOfflineStatusPoll();
+          void scheduleOfflineStatusPoll(attempt);
         } catch (error) {
           if (error instanceof SessionEndedError) {
             setStatusNote("Session ended. Refresh or create a new session.");
             return;
           }
-          if (!cancelled) {
-            void scheduleOfflineStatusPoll();
+          if (!attempt.isStale()) {
+            void scheduleOfflineStatusPoll(attempt);
           }
         }
       }, OFFLINE_STATUS_POLL_MS);
@@ -403,6 +433,7 @@ export function App() {
           }
         }
         previousStatusRef.current = payload;
+        storeViewerToken(currentSessionId, payload.viewerToken);
         setSessionStatus(payload);
         setRequestingControl(Boolean(payload.pendingControlRequest));
         return;
@@ -850,7 +881,21 @@ function detectPlatformTab(): PlatformTab {
 
 function viewerSocketURL(sessionId: string) {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}/api/session/${sessionId}/viewer`;
+  const url = new URL(`${protocol}//${window.location.host}/api/session/${sessionId}/viewer`);
+  const viewerToken = readViewerToken(sessionId);
+  if (viewerToken) {
+    url.searchParams.set("viewerToken", viewerToken);
+  }
+  return url.toString();
+}
+
+function sessionStatusURL(sessionId: string) {
+  const url = new URL(`/api/session/${sessionId}`, window.location.origin);
+  const viewerToken = readViewerToken(sessionId);
+  if (viewerToken) {
+    url.searchParams.set("viewerToken", viewerToken);
+  }
+  return url.toString();
 }
 
 function buildSessionInfo(sessionId: string | null): SessionInfo | null {
@@ -896,6 +941,24 @@ function normalizeWebSocketURL(value: string, protocol: string) {
   const resolved = new URL(value, window.location.origin);
   resolved.protocol = protocol;
   return resolved.toString();
+}
+
+function viewerTokenStorageKey(sessionId: string) {
+  return `ttys.viewerToken.${sessionId}`;
+}
+
+function readViewerToken(sessionId: string) {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  return window.sessionStorage.getItem(viewerTokenStorageKey(sessionId));
+}
+
+function storeViewerToken(sessionId: string, token: string | null) {
+  if (!token || typeof window === "undefined") {
+    return;
+  }
+  window.sessionStorage.setItem(viewerTokenStorageKey(sessionId), token);
 }
 
 function formatDeadline(timestamp: number | null, now: number) {

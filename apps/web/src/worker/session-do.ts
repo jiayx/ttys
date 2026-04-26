@@ -10,6 +10,7 @@ type SessionRole = "host" | "viewer";
 type HostState = "waiting" | "online" | "reconnecting" | "offline";
 type ViewerInfo = {
   id: string;
+  token: string;
   socket: WebSocket;
 };
 type ControlRequest = {
@@ -22,6 +23,7 @@ type SessionRecord = {
   controlLeaseExpiresAt: number | null;
   pendingRequest: ControlRequest | null;
   pendingRequestExpiresAt: number | null;
+  viewerIdentities: Record<string, string>;
   createdAt: number;
   maxExpiresAt: number;
   sessionExpiresAt: number;
@@ -34,6 +36,7 @@ type SocketAttachment =
   | {
       role: "viewer";
       viewerId: string;
+      viewerToken: string;
     };
 type Env = Record<string, unknown>;
 
@@ -54,6 +57,7 @@ function createInitialSessionRecord(state: SessionState = "idle"): SessionRecord
     controlLeaseExpiresAt: null,
     pendingRequest: null,
     pendingRequestExpiresAt: null,
+    viewerIdentities: {},
     createdAt,
     maxExpiresAt: createdAt + SESSION_MAX_TTL_MS,
     sessionExpiresAt: Math.min(createdAt + SESSION_IDLE_TTL_MS, createdAt + SESSION_MAX_TTL_MS),
@@ -95,15 +99,15 @@ export class TTYSession extends DurableObject {
 
     if (url.pathname === "/status" && request.method === "GET") {
       await this.advanceRecordAndPersist();
-      return Response.json(this.snapshot());
+      return Response.json(this.snapshotForViewerToken(url.searchParams.get("viewerToken")));
     }
 
     if (url.pathname === "/connect/host") {
-      return this.acceptSocket("host");
+      return this.acceptSocket("host", request);
     }
 
     if (url.pathname === "/connect/viewer") {
-      return this.acceptSocket("viewer");
+      return this.acceptSocket("viewer", request);
     }
 
     return new Response("Not Found", { status: 404 });
@@ -117,7 +121,7 @@ export class TTYSession extends DurableObject {
     await this.scheduleNextAlarm();
   }
 
-  private async acceptSocket(role: SessionRole): Promise<Response> {
+  private async acceptSocket(role: SessionRole, request: Request): Promise<Response> {
     await this.advanceRecordAndPersist();
 
     const pair = new WebSocketPair();
@@ -135,11 +139,16 @@ export class TTYSession extends DurableObject {
         record.state = "active";
       });
     } else {
-      const viewerId = crypto.randomUUID().slice(0, 8);
-      server.serializeAttachment({ role, viewerId });
+      const viewerIdentity = await this.resolveViewerIdentity(request);
+      server.serializeAttachment({
+        role,
+        viewerId: viewerIdentity.id,
+        viewerToken: viewerIdentity.token,
+      });
       this.ctx.acceptWebSocket(server, [role]);
       this.viewers.set(server, {
-        id: viewerId,
+        id: viewerIdentity.id,
+        token: viewerIdentity.token,
         socket: server,
       });
     }
@@ -210,6 +219,7 @@ export class TTYSession extends DurableObject {
 
       this.viewers.set(socket, {
         id: attachment.viewerId,
+        token: attachment.viewerToken,
         socket,
       });
     }
@@ -245,7 +255,27 @@ export class TTYSession extends DurableObject {
       return;
     }
 
-    this.record = record;
+    this.record = {
+      ...record,
+      viewerIdentities: record.viewerIdentities ?? {},
+    };
+  }
+
+  private async resolveViewerIdentity(request: Request) {
+    const token = validViewerToken(new URL(request.url).searchParams.get("viewerToken"));
+    if (token) {
+      const existingViewerId = this.record.viewerIdentities[token];
+      if (existingViewerId) {
+        return { id: existingViewerId, token };
+      }
+    }
+
+    const viewerToken = randomViewerToken();
+    const viewerId = crypto.randomUUID().slice(0, 8);
+    await this.updateRecord((record) => {
+      record.viewerIdentities[viewerToken] = viewerId;
+    });
+    return { id: viewerId, token: viewerToken };
   }
 
   private async persistRecord() {
@@ -360,10 +390,6 @@ export class TTYSession extends DurableObject {
     this.hostConnected = false;
     await this.updateRecord((record) => {
       record.hostDisconnectDeadline = Date.now() + HOST_DISCONNECT_GRACE_MS;
-      record.currentControllerId = null;
-      record.controlLeaseExpiresAt = null;
-      record.pendingRequest = null;
-      record.pendingRequestExpiresAt = null;
       record.state = "ready";
     });
     this.broadcastStatus();
@@ -465,6 +491,20 @@ export class TTYSession extends DurableObject {
 
   private snapshot(socket?: WebSocket, role?: SessionRole) {
     const viewer = socket ? this.viewers.get(socket) : null;
+    return this.snapshotForViewer(viewer ?? null, role ?? null);
+  }
+
+  private snapshotForViewerToken(viewerToken: string | null) {
+    const token = validViewerToken(viewerToken);
+    const viewerId = token ? this.record.viewerIdentities[token] : null;
+    const viewer = token && viewerId ? { id: viewerId, token } : null;
+    return this.snapshotForViewer(viewer, viewer ? "viewer" : null);
+  }
+
+  private snapshotForViewer(
+    viewer: Pick<ViewerInfo, "id" | "token"> | null,
+    role: SessionRole | null,
+  ) {
     let pendingControlRequest: ControlRequest | null = null;
     if (role === "host") {
       pendingControlRequest = this.record.pendingRequest;
@@ -479,7 +519,8 @@ export class TTYSession extends DurableObject {
       hostConnected: this.hostConnected,
       viewerCount: this.viewers.size,
       viewerId: viewer?.id ?? null,
-      canWrite: viewer ? this.canWrite(socket!) : false,
+      viewerToken: viewer?.token ?? null,
+      canWrite: viewer?.id === this.record.currentControllerId,
       controllerViewerId: this.record.currentControllerId,
       controlLeaseExpiresAt: this.record.controlLeaseExpiresAt,
       pendingControlRequest,
@@ -563,18 +604,11 @@ export class TTYSession extends DurableObject {
     const viewer = this.viewers.get(socket);
     this.viewers.delete(socket);
 
-    if (
-      viewer?.id !== this.record.currentControllerId &&
-      viewer?.id !== this.record.pendingRequest?.viewerId
-    ) {
+    if (viewer?.id !== this.record.pendingRequest?.viewerId) {
       return;
     }
 
     await this.updateRecord((record) => {
-      if (viewer?.id === record.currentControllerId) {
-        record.currentControllerId = null;
-        record.controlLeaseExpiresAt = null;
-      }
       if (viewer?.id === record.pendingRequest?.viewerId) {
         record.pendingRequest = null;
         record.pendingRequestExpiresAt = null;
@@ -708,4 +742,15 @@ function normalizeLeaseSeconds(payload: unknown, fallback = DEFAULT_CONTROL_LEAS
   }
 
   return Math.max(60, Math.min(Math.trunc(value), DEFAULT_CONTROL_LEASE_SECONDS));
+}
+
+function randomViewerToken() {
+  return crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
+}
+
+function validViewerToken(value: string | null) {
+  if (!value || !/^[0-9a-f]{64}$/.test(value)) {
+    return null;
+  }
+  return value;
 }
