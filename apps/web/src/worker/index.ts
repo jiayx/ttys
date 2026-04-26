@@ -221,7 +221,6 @@ async function proxyLatestReleaseAsset(
   const upstreamURL = latestReleaseAssetURL(env, assetName);
   const upstream = await fetch(upstreamURL, {
     headers: {
-      "accept-encoding": "identity",
       "user-agent": "ttys-bootstrap-proxy",
     },
     redirect: "follow",
@@ -245,7 +244,7 @@ async function serveLocalDownloadAsset(
     return new Response("unknown local asset", { status: 404 });
   }
 
-  const upstream = await env.ASSETS.fetch(identityRequest(request));
+  const upstream = await env.ASSETS.fetch(request);
   if (!upstream.ok || !upstream.body) {
     return upstream;
   }
@@ -275,46 +274,21 @@ function downloadAssetResponse(
   headers.set("cache-control", cacheControl);
   headers.set("content-type", contentTypeForAsset(assetName, upstream));
   headers.set("content-disposition", `attachment; filename="${assetName}"`);
-  const contentLength = upstream.headers.get("content-length");
-  if (contentLength && !shouldCompress) {
-    headers.set("content-length", contentLength);
-  }
   if (shouldCompress) {
     headers.set("content-encoding", "gzip");
     headers.set("vary", "accept-encoding");
   }
 
-  const body = shouldCompress
-    ? upstream.body!.pipeThrough(new CompressionStream("gzip"))
-    : upstream.body;
-
-  return new Response(body, {
+  return new Response(upstream.body, {
     status: 200,
     headers,
   });
-}
-
-function identityRequest(request: Request) {
-  const headers = new Headers(request.headers);
-  headers.set("accept-encoding", "identity");
-  return new Request(request, { headers });
 }
 
 function shouldGzipResponse(request: Request, assetName: string) {
   if (assetName === "checksums.txt") {
     return false;
   }
-  const acceptEncoding = request.headers.get("accept-encoding");
-  if (!acceptEncoding) {
-    return false;
-  }
 
-  return acceptEncoding.split(",").some((encoding) => {
-    const [name, ...parameters] = encoding.trim().toLowerCase().split(";");
-    if (name !== "gzip") {
-      return false;
-    }
-
-    return !parameters.some((parameter) => parameter.trim() === "q=0");
-  });
+  return request.headers.get("accept-encoding")?.includes("gzip") ?? false;
 }

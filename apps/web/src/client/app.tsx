@@ -42,6 +42,8 @@ type FlashPalette = {
   secondGlow: string;
 };
 
+const OFFLINE_STATUS_POLL_MS = 3000;
+
 export function App() {
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const terminal = useRef<TerminalController | null>(null);
@@ -197,9 +199,10 @@ export function App() {
 
       if (status.state === "closed") {
         setSessionStatus(status);
-        setStatusNote("Session ended. Refresh or create a new session.");
+        setStatusNote("Session is offline. Waiting for the host to reconnect...");
         setTransportState("closed");
         setConnecting(false);
+        void scheduleOfflineStatusPoll();
         return;
       }
 
@@ -296,7 +299,8 @@ export function App() {
         setSessionStatus(status);
         if (status.state === "closed") {
           setTransportState("closed");
-          setStatusNote("Session ended. Refresh or create a new session.");
+          setStatusNote("Session is offline. Waiting for the host to reconnect...");
+          void scheduleOfflineStatusPoll();
           return;
         }
 
@@ -316,6 +320,47 @@ export function App() {
           void connectViewer();
         }, delay);
       }
+    }
+
+    async function scheduleOfflineStatusPoll() {
+      clearReconnectTimer();
+      setConnecting(false);
+      setTransportState("closed");
+
+      reconnectTimer.current = window.setTimeout(async () => {
+        if (cancelled) {
+          return;
+        }
+
+        try {
+          const response = await fetch(`/api/session/${currentSessionId}`);
+          if (!response.ok) {
+            setStatusNote("Session is offline. Waiting for the host to reconnect...");
+            void scheduleOfflineStatusPoll();
+            return;
+          }
+
+          const status = (await response.json()) as SessionStatus;
+          if (cancelled) {
+            return;
+          }
+
+          setSessionStatus(status);
+          if (status.state !== "closed" || status.hostConnected) {
+            setStatusNote("Host is back online. Reconnecting viewer...");
+            void connectViewer();
+            return;
+          }
+
+          setStatusNote("Session is offline. Waiting for the host to reconnect...");
+          void scheduleOfflineStatusPoll();
+        } catch {
+          if (!cancelled) {
+            setStatusNote("Session is offline. Waiting for the host to reconnect...");
+            void scheduleOfflineStatusPoll();
+          }
+        }
+      }, OFFLINE_STATUS_POLL_MS);
     }
 
     function handleControlFrame(frame: Record<string, unknown>) {
