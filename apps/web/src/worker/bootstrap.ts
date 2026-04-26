@@ -49,7 +49,7 @@ DOWNLOAD_URL="$BINARY_BASE_URL/$ASSET_NAME"
 CHECKSUMS_PATH="$TMP_DIR/ttys-agent-checksums.txt"
 
 if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$DOWNLOAD_URL" -o "$AGENT_PATH"
+  curl -fsSL --compressed "$DOWNLOAD_URL" -o "$AGENT_PATH"
   curl -fsSL "$CHECKSUMS_URL" -o "$CHECKSUMS_PATH"
 elif command -v wget >/dev/null 2>&1; then
   wget -qO "$AGENT_PATH" "$DOWNLOAD_URL"
@@ -126,7 +126,22 @@ $AgentPath = Join-Path $Tmp $AssetName
 $DownloadUrl = "$BinaryBaseUrl/$AssetName"
 $ChecksumsPath = Join-Path $Tmp "ttys-agent-checksums.txt"
 
-Invoke-WebRequest -UseBasicParsing -Uri $DownloadUrl -OutFile $AgentPath
+$HttpHandler = [System.Net.Http.HttpClientHandler]::new()
+$HttpHandler.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+$HttpClient = [System.Net.Http.HttpClient]::new($HttpHandler)
+try {
+  $AgentResponse = $HttpClient.GetAsync($DownloadUrl).GetAwaiter().GetResult()
+  try {
+    $AgentResponse.EnsureSuccessStatusCode() | Out-Null
+    $AgentBytes = $AgentResponse.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+  } finally {
+    $AgentResponse.Dispose()
+  }
+  [System.IO.File]::WriteAllBytes($AgentPath, $AgentBytes)
+} finally {
+  $HttpClient.Dispose()
+  $HttpHandler.Dispose()
+}
 Invoke-WebRequest -UseBasicParsing -Uri $ChecksumsUrl -OutFile $ChecksumsPath
 
 $ExpectedChecksum = $null

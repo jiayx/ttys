@@ -23,6 +23,7 @@ type SocketAttachment =
       role: "viewer";
       viewerId: string;
     };
+type Env = Record<string, unknown>;
 
 const DEFAULT_CONTROL_LEASE_SECONDS = 30 * 60;
 const SESSION_IDLE_TTL_MS = 2 * 60 * 60 * 1000;
@@ -48,7 +49,7 @@ export class TTYSession extends DurableObject {
   private sessionExpiresAt = this.createdAt + SESSION_IDLE_TTL_MS;
   private hostDisconnectDeadline: number | null = null;
 
-  constructor(ctx: DurableObjectState, env: unknown) {
+  constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.restoreSockets();
   }

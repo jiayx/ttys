@@ -79,7 +79,14 @@ export default {
       const assetName = url.pathname.slice("/downloads/release/".length);
       if (!assetName) return new Response("missing asset name", { status: 400 });
 
-      return proxyLatestReleaseAsset(env, assetName);
+      return proxyLatestReleaseAsset(request, env, assetName);
+    }
+
+    if (url.pathname.startsWith("/downloads/local/") && request.method === "GET") {
+      const assetName = url.pathname.slice("/downloads/local/".length);
+      if (!assetName) return new Response("missing asset name", { status: 400 });
+
+      return serveLocalDownloadAsset(request, env, assetName);
     }
 
     if (url.pathname === "/api/session" && request.method === "POST") {
@@ -202,7 +209,11 @@ function latestReleaseAssetURL(env: Env, assetName: string): string {
   return `https://github.com/${repository}/releases/latest/download/${assetName}`;
 }
 
-async function proxyLatestReleaseAsset(env: Env, assetName: string): Promise<Response> {
+async function proxyLatestReleaseAsset(
+  request: Request,
+  env: Env,
+  assetName: string,
+): Promise<Response> {
   if (!isAllowedReleaseAsset(assetName)) {
     return new Response("unknown release asset", { status: 404 });
   }
@@ -210,6 +221,7 @@ async function proxyLatestReleaseAsset(env: Env, assetName: string): Promise<Res
   const upstreamURL = latestReleaseAssetURL(env, assetName);
   const upstream = await fetch(upstreamURL, {
     headers: {
+      "accept-encoding": "identity",
       "user-agent": "ttys-bootstrap-proxy",
     },
     redirect: "follow",
@@ -221,19 +233,24 @@ async function proxyLatestReleaseAsset(env: Env, assetName: string): Promise<Res
     });
   }
 
-  const headers = new Headers();
-  headers.set("cache-control", "public, max-age=300");
-  headers.set("content-type", contentTypeForAsset(assetName, upstream));
-  headers.set("content-disposition", `attachment; filename="${assetName}"`);
-  const contentLength = upstream.headers.get("content-length");
-  if (contentLength) {
-    headers.set("content-length", contentLength);
+  return downloadAssetResponse(request, assetName, upstream, "public, max-age=300");
+}
+
+async function serveLocalDownloadAsset(
+  request: Request,
+  env: Env,
+  assetName: string,
+): Promise<Response> {
+  if (!isAllowedReleaseAsset(assetName)) {
+    return new Response("unknown local asset", { status: 404 });
   }
 
-  return new Response(upstream.body, {
-    status: 200,
-    headers,
-  });
+  const upstream = await env.ASSETS.fetch(identityRequest(request));
+  if (!upstream.ok || !upstream.body) {
+    return upstream;
+  }
+
+  return downloadAssetResponse(request, assetName, upstream, "public, max-age=60");
 }
 
 function isAllowedReleaseAsset(assetName: string) {
@@ -245,4 +262,59 @@ function contentTypeForAsset(assetName: string, upstream: Response) {
     return "text/plain; charset=utf-8";
   }
   return upstream.headers.get("content-type") ?? "application/octet-stream";
+}
+
+function downloadAssetResponse(
+  request: Request,
+  assetName: string,
+  upstream: Response,
+  cacheControl: string,
+) {
+  const shouldCompress = shouldGzipResponse(request, assetName);
+  const headers = new Headers();
+  headers.set("cache-control", cacheControl);
+  headers.set("content-type", contentTypeForAsset(assetName, upstream));
+  headers.set("content-disposition", `attachment; filename="${assetName}"`);
+  const contentLength = upstream.headers.get("content-length");
+  if (contentLength && !shouldCompress) {
+    headers.set("content-length", contentLength);
+  }
+  if (shouldCompress) {
+    headers.set("content-encoding", "gzip");
+    headers.set("vary", "accept-encoding");
+  }
+
+  const body = shouldCompress
+    ? upstream.body!.pipeThrough(new CompressionStream("gzip"))
+    : upstream.body;
+
+  return new Response(body, {
+    status: 200,
+    headers,
+  });
+}
+
+function identityRequest(request: Request) {
+  const headers = new Headers(request.headers);
+  headers.set("accept-encoding", "identity");
+  return new Request(request, { headers });
+}
+
+function shouldGzipResponse(request: Request, assetName: string) {
+  if (assetName === "checksums.txt") {
+    return false;
+  }
+  const acceptEncoding = request.headers.get("accept-encoding");
+  if (!acceptEncoding) {
+    return false;
+  }
+
+  return acceptEncoding.split(",").some((encoding) => {
+    const [name, ...parameters] = encoding.trim().toLowerCase().split(";");
+    if (name !== "gzip") {
+      return false;
+    }
+
+    return !parameters.some((parameter) => parameter.trim() === "q=0");
+  });
 }
