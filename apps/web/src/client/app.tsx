@@ -16,6 +16,7 @@ type SessionInfo = {
 type SessionStatus = {
   role: "host" | "viewer" | null;
   state: "idle" | "ready" | "active" | "closed";
+  hostState: HostState;
   hostConnected: boolean;
   viewerCount: number;
   viewerId: string | null;
@@ -34,6 +35,7 @@ type SessionStatus = {
 
 type PlatformTab = "macos" | "linux" | "windows";
 type TransportState = "idle" | "connecting" | "connected" | "reconnecting" | "closed" | "error";
+type HostState = "waiting" | "online" | "reconnecting" | "offline";
 type CopyLabel = "Copy" | "Copied" | "Copy failed";
 type FlashPalette = {
   first: string;
@@ -199,7 +201,6 @@ export function App() {
 
       if (status.state === "closed") {
         setSessionStatus(status);
-        setStatusNote("Session is offline. Waiting for the host to reconnect...");
         setTransportState("closed");
         setConnecting(false);
         void scheduleOfflineStatusPoll();
@@ -214,7 +215,6 @@ export function App() {
       ws.binaryType = "arraybuffer";
       activeSocket = ws;
       socket.current = ws;
-      const wasReconnect = reconnectAttempts.current > 0;
 
       ws.addEventListener("open", () => {
         if (cancelled || activeSocket !== ws) {
@@ -223,11 +223,6 @@ export function App() {
         clearReconnectTimer();
         setTransportState("connected");
         setConnecting(false);
-        if (wasReconnect) {
-          setStatusNote("Viewer reconnected.");
-        } else {
-          setStatusNote(null);
-        }
         reconnectAttempts.current = 0;
       });
 
@@ -299,12 +294,10 @@ export function App() {
         setSessionStatus(status);
         if (status.state === "closed") {
           setTransportState("closed");
-          setStatusNote("Session is offline. Waiting for the host to reconnect...");
           void scheduleOfflineStatusPoll();
           return;
         }
 
-        setStatusNote(`Connection lost. Reconnecting in ${delay / 1000}s...`);
         reconnectTimer.current = window.setTimeout(() => {
           if (cancelled) {
             return;
@@ -312,7 +305,6 @@ export function App() {
           void connectViewer();
         }, delay);
       } catch {
-        setStatusNote(`Connection lost. Reconnecting in ${delay / 1000}s...`);
         reconnectTimer.current = window.setTimeout(() => {
           if (cancelled) {
             return;
@@ -335,7 +327,6 @@ export function App() {
         try {
           const response = await fetch(`/api/session/${currentSessionId}`);
           if (!response.ok) {
-            setStatusNote("Session is offline. Waiting for the host to reconnect...");
             void scheduleOfflineStatusPoll();
             return;
           }
@@ -347,16 +338,13 @@ export function App() {
 
           setSessionStatus(status);
           if (status.state !== "closed" || status.hostConnected) {
-            setStatusNote("Host is back online. Reconnecting viewer...");
             void connectViewer();
             return;
           }
 
-          setStatusNote("Session is offline. Waiting for the host to reconnect...");
           void scheduleOfflineStatusPoll();
         } catch {
           if (!cancelled) {
-            setStatusNote("Session is offline. Waiting for the host to reconnect...");
             void scheduleOfflineStatusPoll();
           }
         }
@@ -563,7 +551,7 @@ export function App() {
   const connectionLabel = transportLabel(transportState);
   const canRequestControl =
     Boolean(sessionId) &&
-    Boolean(sessionStatus?.hostConnected) &&
+    sessionStatus?.hostState === "online" &&
     !sessionStatus?.canWrite &&
     !sessionStatus?.hasPendingControlRequest &&
     sessionStatus?.controllerViewerId === null;
@@ -627,8 +615,8 @@ export function App() {
             <dl className="mt-3 grid grid-cols-2 gap-3 text-sm">
               <div className="rounded-2xl border border-white/8 bg-black/15 p-3">
                 <dt className="text-xs uppercase tracking-[0.18em] text-stone-500">Host</dt>
-                <dd className="mt-1 text-stone-200">
-                  {sessionStatus?.hostConnected ? "Connected" : "Waiting"}
+                <dd className="mt-1 capitalize text-stone-200">
+                  {sessionStatus?.hostState ?? "waiting"}
                 </dd>
               </div>
               <div className="rounded-2xl border border-white/8 bg-black/15 p-3">

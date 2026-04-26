@@ -7,6 +7,7 @@ import {
 
 type SessionState = "idle" | "ready" | "active" | "closed";
 type SessionRole = "host" | "viewer";
+type HostState = "waiting" | "online" | "reconnecting" | "offline";
 type ViewerInfo = {
   id: string;
   socket: WebSocket;
@@ -389,6 +390,7 @@ export class TTYSession extends DurableObject {
     return {
       role: role ?? null,
       state: this.state,
+      hostState: this.hostState(),
       hostConnected: this.hostConnected,
       viewerCount: this.viewers.size,
       viewerId: viewer?.id ?? null,
@@ -401,6 +403,19 @@ export class TTYSession extends DurableObject {
       hostDisconnectDeadline: this.hostDisconnectDeadline,
       pendingRequestExpiresAt: this.pendingRequestExpiresAt,
     };
+  }
+
+  private hostState(): HostState {
+    if (this.state === "closed") {
+      return "offline";
+    }
+    if (this.hostConnected) {
+      return "online";
+    }
+    if (this.hostDisconnectDeadline) {
+      return "reconnecting";
+    }
+    return "waiting";
   }
 
   private broadcastStatus() {
