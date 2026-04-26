@@ -629,6 +629,26 @@ export function App() {
     createSessionLabel = "New session";
   }
 
+  let accessDescription =
+    "Viewers are read-only by default. Request control to type into the host shell.";
+  if (statusNote) {
+    accessDescription = statusNote;
+  } else if (sessionStatus?.canWrite) {
+    accessDescription = leaseLabel
+      ? `Control is active. Lease valid until ${leaseLabel}.`
+      : "Control is active.";
+  } else if (requestingControl || sessionStatus?.pendingControlRequest) {
+    accessDescription = "Control request sent. Waiting for host approval.";
+  } else if (sessionStatus?.controllerViewerId) {
+    accessDescription = "Another viewer currently controls the host shell.";
+  } else if (sessionStatus?.hostState === "reconnecting") {
+    accessDescription = "Host disconnected. Control will resume if the host reconnects in time.";
+  } else if (sessionStatus?.hostState === "waiting") {
+    accessDescription = "Waiting for the host to connect.";
+  } else if (sessionStatus?.hostState === "offline") {
+    accessDescription = "Session ended. Refresh or create a new session.";
+  }
+
   return (
     <main className="min-h-screen bg-stone-950 text-stone-100">
       <section className="mx-auto flex min-h-screen max-w-6xl flex-col px-6 py-8">
@@ -712,8 +732,7 @@ export function App() {
                   Access
                 </p>
                 <p className="mt-2 text-sm text-stone-200">
-                  {statusNote ??
-                    "Viewers are read-only by default. Request control to type into the host shell."}
+                  {accessDescription}
                 </p>
                 <button
                   ref={requestControlButtonRef}

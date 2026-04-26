@@ -146,11 +146,13 @@ export class TTYSession extends DurableObject {
         viewerToken: viewerIdentity.token,
       });
       this.ctx.acceptWebSocket(server, [role]);
-      this.viewers.set(server, {
+      const viewer = {
         id: viewerIdentity.id,
         token: viewerIdentity.token,
         socket: server,
-      });
+      };
+      this.viewers.set(server, viewer);
+      this.replaceViewerConnection(viewer, "replaced by newer viewer");
     }
 
     this.sendSocket(
@@ -217,11 +219,13 @@ export class TTYSession extends DurableObject {
         continue;
       }
 
-      this.viewers.set(socket, {
+      const viewer = {
         id: attachment.viewerId,
         token: attachment.viewerToken,
         socket,
-      });
+      };
+      this.viewers.set(socket, viewer);
+      this.replaceViewerConnection(viewer, "replaced by newer viewer");
     }
 
     return this.reconcileRecordWithSockets();
@@ -585,6 +589,17 @@ export class TTYSession extends DurableObject {
 
     void this.removeViewer(viewer.socket);
     return false;
+  }
+
+  private replaceViewerConnection(nextViewer: ViewerInfo, reason: string) {
+    for (const [socket, viewer] of this.viewers.entries()) {
+      if (socket === nextViewer.socket || viewer.token !== nextViewer.token) {
+        continue;
+      }
+
+      this.viewers.delete(socket);
+      socket.close(1012, reason);
+    }
   }
 
   private sendSocket(socket: WebSocket, message: string | ArrayBuffer) {
