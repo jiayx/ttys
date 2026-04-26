@@ -567,6 +567,13 @@ export function App() {
     requestControlLabel = "Another viewer is controlling";
   }
 
+  let createSessionLabel = "Create session";
+  if (creating) {
+    createSessionLabel = "Creating...";
+  } else if (sessionId) {
+    createSessionLabel = "New session";
+  }
+
   return (
     <main className="min-h-screen bg-stone-950 text-stone-100">
       <section className="mx-auto flex min-h-screen max-w-6xl flex-col px-6 py-8">
@@ -609,7 +616,7 @@ export function App() {
                 disabled={creating}
                 className="rounded-full border border-amber-400/60 bg-amber-400/10 px-3.5 py-1.5 text-xs font-semibold text-amber-200 shadow-[0_0_20px_rgba(251,191,36,0.12)] transition hover:border-amber-300 hover:bg-amber-400/20 hover:text-amber-100 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/10 disabled:text-stone-500 disabled:shadow-none"
               >
-                {creating ? "Creating..." : sessionId ? "New session" : "Create session"}
+                {createSessionLabel}
               </button>
             </div>
             <dl className="mt-3 grid grid-cols-2 gap-3 text-sm">

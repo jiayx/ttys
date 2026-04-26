@@ -16,6 +16,17 @@ type ControlRequest = {
   viewerId: string;
   leaseSeconds: number;
 };
+type SessionRecord = {
+  state: SessionState;
+  currentControllerId: string | null;
+  controlLeaseExpiresAt: number | null;
+  pendingRequest: ControlRequest | null;
+  pendingRequestExpiresAt: number | null;
+  createdAt: number;
+  maxExpiresAt: number;
+  sessionExpiresAt: number;
+  hostDisconnectDeadline: number | null;
+};
 type SocketAttachment =
   | {
       role: "host";
@@ -33,45 +44,57 @@ const SESSION_RENEW_THRESHOLD_MS = 30 * 60 * 1000;
 const HOST_DISCONNECT_GRACE_MS = 60 * 1000;
 const PENDING_REQUEST_TIMEOUT_MS = 30 * 1000;
 const REPLAY_BUFFER_MAX_BYTES = 2 * 1024 * 1024;
+const SESSION_RECORD_KEY = "session";
+
+function createInitialSessionRecord(state: SessionState = "idle"): SessionRecord {
+  const createdAt = Date.now();
+  return {
+    state,
+    currentControllerId: null,
+    controlLeaseExpiresAt: null,
+    pendingRequest: null,
+    pendingRequestExpiresAt: null,
+    createdAt,
+    maxExpiresAt: createdAt + SESSION_MAX_TTL_MS,
+    sessionExpiresAt: Math.min(createdAt + SESSION_IDLE_TTL_MS, createdAt + SESSION_MAX_TTL_MS),
+    hostDisconnectDeadline: null,
+  };
+}
 
 export class TTYSession extends DurableObject {
   private host: WebSocket | null = null;
   private viewers = new Map<WebSocket, ViewerInfo>();
-  private state: SessionState = "idle";
   private hostConnected = false;
   private buffer: ArrayBuffer[] = [];
   private bufferBytes = 0;
-  private currentControllerId: string | null = null;
-  private controlLeaseExpiresAt: number | null = null;
-  private pendingRequest: ControlRequest | null = null;
-  private pendingRequestExpiresAt: number | null = null;
-  private createdAt = Date.now();
-  private maxExpiresAt = this.createdAt + SESSION_MAX_TTL_MS;
-  private sessionExpiresAt = this.createdAt + SESSION_IDLE_TTL_MS;
-  private hostDisconnectDeadline: number | null = null;
+  private record: SessionRecord = createInitialSessionRecord();
+  private persistQueue: Promise<void> = Promise.resolve();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.restoreSockets();
+    this.ctx.blockConcurrencyWhile(async () => {
+      await this.restoreSessionRecord();
+      if (this.restoreSockets()) {
+        await this.persistRecord();
+      }
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === "/init" && request.method === "POST") {
-      if (this.state !== "idle" && this.state !== "closed") {
+      if (this.record.state !== "idle" && this.record.state !== "closed") {
         return new Response("session id already exists", { status: 409 });
       }
-      this.state = "ready";
-      this.createdAt = Date.now();
-      this.maxExpiresAt = this.createdAt + SESSION_MAX_TTL_MS;
-      this.sessionExpiresAt = Math.min(this.createdAt + SESSION_IDLE_TTL_MS, this.maxExpiresAt);
+      this.record = createInitialSessionRecord("ready");
+      await this.persistRecord();
       await this.scheduleNextAlarm();
       return Response.json(this.snapshot());
     }
 
     if (url.pathname === "/status" && request.method === "GET") {
-      this.advanceState();
+      await this.advanceRecordAndPersist();
       return Response.json(this.snapshot());
     }
 
@@ -87,16 +110,19 @@ export class TTYSession extends DurableObject {
   }
 
   async alarm(): Promise<void> {
-    this.advanceState();
+    const changed = await this.advanceRecordAndPersist();
+    if (changed) {
+      this.broadcastStatus();
+    }
     await this.scheduleNextAlarm();
   }
 
-  private acceptSocket(role: SessionRole): Response {
-    this.advanceState();
+  private async acceptSocket(role: SessionRole): Promise<Response> {
+    await this.advanceRecordAndPersist();
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    void this.touchSession();
+    await this.touchSession();
 
     if (role === "host") {
       this.host?.close(1012, "replaced by new host");
@@ -104,8 +130,10 @@ export class TTYSession extends DurableObject {
       this.ctx.acceptWebSocket(server, [role]);
       this.host = server;
       this.hostConnected = true;
-      this.hostDisconnectDeadline = null;
-      this.state = "active";
+      await this.updateRecord((record) => {
+        record.hostDisconnectDeadline = null;
+        record.state = "active";
+      });
     } else {
       const viewerId = crypto.randomUUID().slice(0, 8);
       server.serializeAttachment({ role, viewerId });
@@ -177,8 +205,6 @@ export class TTYSession extends DurableObject {
         }
         this.host = socket;
         this.hostConnected = true;
-        this.hostDisconnectDeadline = null;
-        this.state = "active";
         continue;
       }
 
@@ -188,9 +214,51 @@ export class TTYSession extends DurableObject {
       });
     }
 
-    if (!this.hostConnected && this.viewers.size > 0 && this.state === "idle") {
-      this.state = "ready";
+    return this.reconcileRecordWithSockets();
+  }
+
+  private reconcileRecordWithSockets() {
+    if (this.hostConnected) {
+      const changed =
+        this.record.hostDisconnectDeadline !== null || this.record.state !== "active";
+      this.record.hostDisconnectDeadline = null;
+      this.record.state = "active";
+      return changed;
     }
+
+    if (this.viewers.size > 0 && this.record.state === "idle") {
+      this.record.state = "ready";
+      return true;
+    }
+
+    if (this.record.state === "active") {
+      this.record.state = "ready";
+      return true;
+    }
+
+    return false;
+  }
+
+  private async restoreSessionRecord() {
+    const record = await this.ctx.storage.get<SessionRecord>(SESSION_RECORD_KEY);
+    if (!record) {
+      return;
+    }
+
+    this.record = record;
+  }
+
+  private async persistRecord() {
+    const record = { ...this.record };
+    const write = this.persistQueue.then(() => this.ctx.storage.put(SESSION_RECORD_KEY, record));
+    this.persistQueue = write.catch(() => {});
+    await write;
+  }
+
+  private async updateRecord(mutator: (record: SessionRecord) => void) {
+    mutator(this.record);
+    await this.persistRecord();
+    await this.scheduleNextAlarm();
   }
 
   private async handleMessage(
@@ -198,23 +266,26 @@ export class TTYSession extends DurableObject {
     socket: WebSocket,
     data: unknown,
   ) {
-    this.advanceState();
+    const advanced = await this.advanceRecordAndPersist();
+    if (advanced) {
+      this.broadcastStatus();
+    }
 
     if (role === "host") {
       if (typeof data === "string") {
         const frame = parseEnvelope(data);
         if (frame?.type === "control.approve") {
-          this.handleControlApprove(frame.payload);
+          await this.handleControlApprove(frame.payload);
           await this.touchSession();
           return;
         }
         if (frame?.type === "control.reject") {
-          this.handleControlReject(frame.payload);
+          await this.handleControlReject(frame.payload);
           await this.touchSession();
           return;
         }
         if (frame?.type === "control.revoke") {
-          this.handleControlRevoke();
+          await this.handleControlRevoke();
           await this.touchSession();
           return;
         }
@@ -262,7 +333,7 @@ export class TTYSession extends DurableObject {
 
     const frame = parseEnvelope(data);
     if (frame?.type === "control.request") {
-      this.handleControlRequest(socket, frame.payload);
+      await this.handleControlRequest(socket, frame.payload);
       await this.touchSession();
       return;
     }
@@ -274,97 +345,111 @@ export class TTYSession extends DurableObject {
         return;
       }
 
-      this.clearHost();
+      await this.clearHost();
       await this.scheduleNextAlarm();
       return;
     }
 
-    this.removeViewer(socket);
+    await this.removeViewer(socket);
     this.broadcastStatus();
     await this.scheduleNextAlarm();
   }
 
-  private clearHost() {
+  private async clearHost() {
     this.host = null;
     this.hostConnected = false;
-    this.hostDisconnectDeadline = Date.now() + HOST_DISCONNECT_GRACE_MS;
-    this.currentControllerId = null;
-    this.controlLeaseExpiresAt = null;
-    this.pendingRequest = null;
-    this.pendingRequestExpiresAt = null;
-    this.state = "ready";
+    await this.updateRecord((record) => {
+      record.hostDisconnectDeadline = Date.now() + HOST_DISCONNECT_GRACE_MS;
+      record.currentControllerId = null;
+      record.controlLeaseExpiresAt = null;
+      record.pendingRequest = null;
+      record.pendingRequestExpiresAt = null;
+      record.state = "ready";
+    });
     this.broadcastStatus();
   }
 
-  private handleControlRequest(socket: WebSocket, payload: unknown) {
-    this.advanceState();
+  private async handleControlRequest(socket: WebSocket, payload: unknown) {
+    await this.advanceRecordAndPersist();
     const viewer = this.viewers.get(socket);
-    if (!viewer || !this.hostConnected || this.currentControllerId || this.pendingRequest) {
+    if (
+      !viewer ||
+      !this.hostConnected ||
+      this.record.currentControllerId ||
+      this.record.pendingRequest
+    ) {
       return;
     }
 
-    this.pendingRequest = {
-      viewerId: viewer.id,
-      leaseSeconds: normalizeLeaseSeconds(payload),
-    };
-    this.pendingRequestExpiresAt = Date.now() + PENDING_REQUEST_TIMEOUT_MS;
+    await this.updateRecord((record) => {
+      record.pendingRequest = {
+        viewerId: viewer.id,
+        leaseSeconds: normalizeLeaseSeconds(payload),
+      };
+      record.pendingRequestExpiresAt = Date.now() + PENDING_REQUEST_TIMEOUT_MS;
+    });
 
     this.sendHost(
       JSON.stringify({
         type: "control.request",
-        payload: this.pendingRequest,
+        payload: this.record.pendingRequest,
       }),
     );
     this.broadcastStatus();
   }
 
-  private handleControlApprove(payload: unknown) {
-    if (!this.pendingRequest) {
+  private async handleControlApprove(payload: unknown) {
+    if (!this.record.pendingRequest) {
       return;
     }
 
     const approved = payload as { viewerId?: string };
-    if (approved.viewerId !== this.pendingRequest.viewerId) {
+    if (approved.viewerId !== this.record.pendingRequest.viewerId) {
       return;
     }
 
-    this.currentControllerId = this.pendingRequest.viewerId;
-    this.controlLeaseExpiresAt =
-      Date.now() + normalizeLeaseSeconds(payload, this.pendingRequest.leaseSeconds) * 1000;
-    this.pendingRequest = null;
-    this.pendingRequestExpiresAt = null;
+    await this.updateRecord((record) => {
+      record.currentControllerId = record.pendingRequest!.viewerId;
+      record.controlLeaseExpiresAt =
+        Date.now() + normalizeLeaseSeconds(payload, record.pendingRequest!.leaseSeconds) * 1000;
+      record.pendingRequest = null;
+      record.pendingRequestExpiresAt = null;
+    });
     this.broadcastStatus();
   }
 
-  private handleControlReject(payload: unknown) {
-    if (!this.pendingRequest) {
+  private async handleControlReject(payload: unknown) {
+    if (!this.record.pendingRequest) {
       return;
     }
 
     const rejected = payload as { viewerId?: string };
-    if (rejected.viewerId !== this.pendingRequest.viewerId) {
+    if (rejected.viewerId !== this.record.pendingRequest.viewerId) {
       return;
     }
 
-    this.pendingRequest = null;
-    this.pendingRequestExpiresAt = null;
+    await this.updateRecord((record) => {
+      record.pendingRequest = null;
+      record.pendingRequestExpiresAt = null;
+    });
     this.broadcastStatus();
   }
 
-  private handleControlRevoke() {
-    if (!this.currentControllerId) {
+  private async handleControlRevoke() {
+    if (!this.record.currentControllerId) {
       return;
     }
 
-    this.currentControllerId = null;
-    this.controlLeaseExpiresAt = null;
+    await this.updateRecord((record) => {
+      record.currentControllerId = null;
+      record.controlLeaseExpiresAt = null;
+    });
     this.broadcastStatus();
   }
 
   private canWrite(socket: WebSocket) {
-    this.advanceState();
     const viewer = this.viewers.get(socket);
-    return viewer?.id === this.currentControllerId;
+    return viewer?.id === this.record.currentControllerId;
   }
 
   private pushBuffer(chunk: ArrayBuffer) {
@@ -379,47 +464,46 @@ export class TTYSession extends DurableObject {
   }
 
   private snapshot(socket?: WebSocket, role?: SessionRole) {
-    this.advanceState();
     const viewer = socket ? this.viewers.get(socket) : null;
-    const pendingControlRequest =
-      role === "host"
-        ? this.pendingRequest
-        : viewer?.id && this.pendingRequest?.viewerId === viewer.id
-          ? this.pendingRequest
-          : null;
+    let pendingControlRequest: ControlRequest | null = null;
+    if (role === "host") {
+      pendingControlRequest = this.record.pendingRequest;
+    } else if (viewer?.id && this.record.pendingRequest?.viewerId === viewer.id) {
+      pendingControlRequest = this.record.pendingRequest;
+    }
+
     return {
       role: role ?? null,
-      state: this.state,
+      state: this.record.state,
       hostState: this.hostState(),
       hostConnected: this.hostConnected,
       viewerCount: this.viewers.size,
       viewerId: viewer?.id ?? null,
       canWrite: viewer ? this.canWrite(socket!) : false,
-      controllerViewerId: this.currentControllerId,
-      controlLeaseExpiresAt: this.controlLeaseExpiresAt,
+      controllerViewerId: this.record.currentControllerId,
+      controlLeaseExpiresAt: this.record.controlLeaseExpiresAt,
       pendingControlRequest,
-      hasPendingControlRequest: this.pendingRequest !== null,
-      sessionExpiresAt: this.sessionExpiresAt,
-      hostDisconnectDeadline: this.hostDisconnectDeadline,
-      pendingRequestExpiresAt: this.pendingRequestExpiresAt,
+      hasPendingControlRequest: this.record.pendingRequest !== null,
+      sessionExpiresAt: this.record.sessionExpiresAt,
+      hostDisconnectDeadline: this.record.hostDisconnectDeadline,
+      pendingRequestExpiresAt: this.record.pendingRequestExpiresAt,
     };
   }
 
   private hostState(): HostState {
-    if (this.state === "closed") {
+    if (this.record.state === "closed") {
       return "offline";
     }
     if (this.hostConnected) {
       return "online";
     }
-    if (this.hostDisconnectDeadline) {
+    if (this.record.hostDisconnectDeadline) {
       return "reconnecting";
     }
     return "waiting";
   }
 
   private broadcastStatus() {
-    this.advanceState();
     if (this.host) {
       this.sendHost(
         JSON.stringify({
@@ -449,7 +533,7 @@ export class TTYSession extends DurableObject {
       return true;
     }
 
-    this.clearHost();
+    void this.clearHost();
     return false;
   }
 
@@ -458,7 +542,7 @@ export class TTYSession extends DurableObject {
       return true;
     }
 
-    this.removeViewer(viewer.socket);
+    void this.removeViewer(viewer.socket);
     return false;
   }
 
@@ -475,67 +559,96 @@ export class TTYSession extends DurableObject {
     }
   }
 
-  private removeViewer(socket: WebSocket) {
+  private async removeViewer(socket: WebSocket) {
     const viewer = this.viewers.get(socket);
-    if (viewer?.id === this.currentControllerId) {
-      this.currentControllerId = null;
-      this.controlLeaseExpiresAt = null;
-    }
-    if (viewer?.id === this.pendingRequest?.viewerId) {
-      this.pendingRequest = null;
-      this.pendingRequestExpiresAt = null;
-    }
     this.viewers.delete(socket);
-  }
 
-  private advanceState() {
-    const now = Date.now();
-
-    if (this.sessionExpiresAt && now >= this.sessionExpiresAt) {
-      this.closeSession("session expired");
+    if (
+      viewer?.id !== this.record.currentControllerId &&
+      viewer?.id !== this.record.pendingRequest?.viewerId
+    ) {
       return;
     }
 
-    if (this.pendingRequestExpiresAt && now >= this.pendingRequestExpiresAt) {
-      this.pendingRequest = null;
-      this.pendingRequestExpiresAt = null;
+    await this.updateRecord((record) => {
+      if (viewer?.id === record.currentControllerId) {
+        record.currentControllerId = null;
+        record.controlLeaseExpiresAt = null;
+      }
+      if (viewer?.id === record.pendingRequest?.viewerId) {
+        record.pendingRequest = null;
+        record.pendingRequestExpiresAt = null;
+      }
+    });
+  }
+
+  private advanceRecord() {
+    const now = Date.now();
+    let changed = false;
+
+    if (this.record.sessionExpiresAt && now >= this.record.sessionExpiresAt) {
+      this.closeSession("session expired");
+      return true;
     }
 
-    if (this.controlLeaseExpiresAt && now >= this.controlLeaseExpiresAt) {
-      this.currentControllerId = null;
-      this.controlLeaseExpiresAt = null;
+    if (this.record.pendingRequestExpiresAt && now >= this.record.pendingRequestExpiresAt) {
+      this.record.pendingRequest = null;
+      this.record.pendingRequestExpiresAt = null;
+      changed = true;
+    }
+
+    if (this.record.controlLeaseExpiresAt && now >= this.record.controlLeaseExpiresAt) {
+      this.record.currentControllerId = null;
+      this.record.controlLeaseExpiresAt = null;
+      changed = true;
     }
 
     if (
       !this.hostConnected &&
-      this.hostDisconnectDeadline &&
-      now >= this.hostDisconnectDeadline
+      this.record.hostDisconnectDeadline &&
+      now >= this.record.hostDisconnectDeadline
     ) {
       this.closeSession("host disconnected");
-      return;
+      return true;
     }
 
-    if (this.state !== "closed") {
+    if (this.record.state !== "closed") {
       if (this.hostConnected) {
-        this.state = "active";
-      } else if (this.state !== "idle") {
-        this.state = "ready";
+        if (this.record.state !== "active") {
+          this.record.state = "active";
+          changed = true;
+        }
+      } else if (this.record.state !== "idle") {
+        if (this.record.state !== "ready") {
+          this.record.state = "ready";
+          changed = true;
+        }
       }
     }
+
+    return changed;
+  }
+
+  private async advanceRecordAndPersist() {
+    const changed = this.advanceRecord();
+    if (changed) {
+      await this.persistRecord();
+    }
+    return changed;
   }
 
   private closeSession(reason: string) {
-    if (this.state === "closed") {
+    if (this.record.state === "closed") {
       return;
     }
 
-    this.state = "closed";
     this.hostConnected = false;
-    this.hostDisconnectDeadline = null;
-    this.pendingRequest = null;
-    this.pendingRequestExpiresAt = null;
-    this.currentControllerId = null;
-    this.controlLeaseExpiresAt = null;
+    this.record.state = "closed";
+    this.record.hostDisconnectDeadline = null;
+    this.record.pendingRequest = null;
+    this.record.pendingRequestExpiresAt = null;
+    this.record.currentControllerId = null;
+    this.record.controlLeaseExpiresAt = null;
 
     if (this.host) {
       this.host.close(1000, reason);
@@ -548,25 +661,27 @@ export class TTYSession extends DurableObject {
   }
 
   private async touchSession() {
-    if (this.state === "closed") return;
+    if (this.record.state === "closed") return;
 
     const now = Date.now();
-    const remaining = this.sessionExpiresAt - now;
+    const remaining = this.record.sessionExpiresAt - now;
     if (remaining > SESSION_RENEW_THRESHOLD_MS) return;
 
-    const nextExpiresAt = Math.min(now + SESSION_IDLE_TTL_MS, this.maxExpiresAt);
-    if (nextExpiresAt <= this.sessionExpiresAt) return;
+    const nextExpiresAt = Math.min(now + SESSION_IDLE_TTL_MS, this.record.maxExpiresAt);
+    if (nextExpiresAt <= this.record.sessionExpiresAt) return;
 
-    this.sessionExpiresAt = nextExpiresAt;
+    await this.updateRecord((record) => {
+      record.sessionExpiresAt = nextExpiresAt;
+    });
     await this.scheduleNextAlarm();
   }
 
   private async scheduleNextAlarm() {
     const deadlines = [
-      this.sessionExpiresAt,
-      this.hostDisconnectDeadline,
-      this.pendingRequestExpiresAt,
-      this.controlLeaseExpiresAt,
+      this.record.sessionExpiresAt,
+      this.record.hostDisconnectDeadline,
+      this.record.pendingRequestExpiresAt,
+      this.record.controlLeaseExpiresAt,
     ].filter((value): value is number => typeof value === "number" && value > Date.now());
 
     if (deadlines.length === 0) {
