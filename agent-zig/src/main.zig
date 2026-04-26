@@ -709,6 +709,10 @@ fn resizeMain(ctx: *ThreadContext) void {
 
 fn childWaitMain(ctx: *ThreadContext) void {
     ctx.pty.wait() catch |err| {
+        if (err == error.ChildExitedNonZero) {
+            ctx.state.finishOk();
+            return;
+        }
         ctx.state.finishErrFmt("shell wait failed: {s}", .{@errorName(err)});
         return;
     };

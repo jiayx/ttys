@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -269,6 +270,11 @@ func Run(ctx context.Context, cfg Config) error {
 
 	go func() {
 		if waitErr := terminal.Wait(); waitErr != nil {
+			var exitErr *exec.ExitError
+			if errors.As(waitErr, &exitErr) {
+				stop(io.EOF)
+				return
+			}
 			stop(waitErr)
 			return
 		}
