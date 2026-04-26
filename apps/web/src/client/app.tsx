@@ -46,6 +46,8 @@ type FlashPalette = {
 
 const OFFLINE_STATUS_POLL_MS = 3000;
 
+class SessionEndedError extends Error {}
+
 export function App() {
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const terminal = useRef<TerminalController | null>(null);
@@ -168,24 +170,42 @@ export function App() {
       activeSocket = null;
     }
 
+    async function fetchSessionStatus(): Promise<SessionStatus | null> {
+      const response = await fetch(`/api/session/${currentSessionId}`);
+      if (!response.ok) {
+        if (shouldRetrySessionStatus(response)) {
+          return null;
+        }
+        throw new SessionEndedError();
+      }
+      return (await response.json()) as SessionStatus;
+    }
+
+    function scheduleStatusRetry(delay: number, retry: () => void) {
+      reconnectTimer.current = window.setTimeout(() => {
+        if (cancelled) {
+          return;
+        }
+        retry();
+      }, delay);
+    }
+
     async function connectViewer() {
       clearReconnectTimer();
       setConnecting(true);
       setTransportState("connecting");
-      let status: SessionStatus;
+      let status: SessionStatus | null;
 
       try {
-        const response = await fetch(`/api/session/${sessionId}`);
-        if (!response.ok) {
+        status = await fetchSessionStatus();
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        if (error instanceof SessionEndedError) {
           setStatusNote("Session ended. Refresh or create a new session.");
           setTransportState("closed");
           setConnecting(false);
-          return;
-        }
-
-        status = (await response.json()) as SessionStatus;
-      } catch {
-        if (cancelled) {
           return;
         }
         setStatusNote("Unable to reach the server. Retrying...");
@@ -196,6 +216,14 @@ export function App() {
       }
 
       if (cancelled) {
+        return;
+      }
+
+      if (!status) {
+        setStatusNote("Unable to reach the server. Retrying...");
+        setTransportState("reconnecting");
+        setConnecting(false);
+        void scheduleReconnect();
         return;
       }
 
@@ -279,15 +307,13 @@ export function App() {
       const delay = Math.min(1000 * attempt, 5000);
 
       try {
-        const response = await fetch(`/api/session/${sessionId}`);
-        if (!response.ok) {
-          setTransportState("closed");
-          setStatusNote("Session ended. Refresh or create a new session.");
+        const status = await fetchSessionStatus();
+        if (cancelled) {
           return;
         }
 
-        const status = (await response.json()) as SessionStatus;
-        if (cancelled) {
+        if (!status) {
+          scheduleStatusRetry(delay, () => void scheduleReconnect());
           return;
         }
 
@@ -298,19 +324,14 @@ export function App() {
           return;
         }
 
-        reconnectTimer.current = window.setTimeout(() => {
-          if (cancelled) {
-            return;
-          }
-          void connectViewer();
-        }, delay);
-      } catch {
-        reconnectTimer.current = window.setTimeout(() => {
-          if (cancelled) {
-            return;
-          }
-          void connectViewer();
-        }, delay);
+        scheduleStatusRetry(delay, () => void connectViewer());
+      } catch (error) {
+        if (error instanceof SessionEndedError) {
+          setTransportState("closed");
+          setStatusNote("Session ended. Refresh or create a new session.");
+          return;
+        }
+        scheduleStatusRetry(delay, () => void scheduleReconnect());
       }
     }
 
@@ -325,14 +346,13 @@ export function App() {
         }
 
         try {
-          const response = await fetch(`/api/session/${currentSessionId}`);
-          if (!response.ok) {
-            void scheduleOfflineStatusPoll();
+          const status = await fetchSessionStatus();
+          if (cancelled) {
             return;
           }
 
-          const status = (await response.json()) as SessionStatus;
-          if (cancelled) {
+          if (!status) {
+            void scheduleOfflineStatusPoll();
             return;
           }
 
@@ -343,7 +363,11 @@ export function App() {
           }
 
           void scheduleOfflineStatusPoll();
-        } catch {
+        } catch (error) {
+          if (error instanceof SessionEndedError) {
+            setStatusNote("Session ended. Refresh or create a new session.");
+            return;
+          }
           if (!cancelled) {
             void scheduleOfflineStatusPoll();
           }
@@ -908,6 +932,10 @@ function transportLabel(value: string) {
     default:
       return "Idle";
   }
+}
+
+function shouldRetrySessionStatus(response: Response) {
+  return response.status === 429 || response.status >= 500;
 }
 
 function pickFlashPalette(): FlashPalette {
